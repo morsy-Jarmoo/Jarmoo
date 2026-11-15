@@ -1,0 +1,1638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarmoo</title>
+<meta name="theme-color" content="#060b14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<script>
+/* ===== Jarmoo STANDALONE layer: runs without Claude, in any modern browser ===== */
+(function(){
+  const LS={get:(k,d)=>{try{const v=localStorage.getItem(k);return v===null?d:v}catch(e){return d}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+  window.JM_STANDALONE=true;
+
+  /* --- vault: served from the embedded copy --- */
+  const _fetch=window.fetch.bind(window);
+  function idb(){return new Promise((res,rej)=>{const r=indexedDB.open("jarmoo",1);r.onupgradeneeded=()=>r.result.createObjectStore("kv");r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+  async function idbGet(k){const db=await idb();return new Promise(res=>{const q=db.transaction("kv").objectStore("kv").get(k);q.onsuccess=()=>res(q.result);q.onerror=()=>res(null)})}
+  async function idbSet(k,v){const db=await idb();return new Promise((res,rej)=>{const t=db.transaction("kv","readwrite");t.objectStore("kv").put(v,k);t.oncomplete=res;t.onerror=()=>rej(t.error)})}
+  window.JM_IDB={get:idbGet,set:idbSet};
+  window.fetch=async function(u,o){
+    if(typeof u==="string"&&/(^|\/)vault\.json$/.test(u)){
+      const el=document.getElementById("vaultdata");let txt=el?el.textContent:null;
+      if(!txt){try{txt=await idbGet("vault")}catch(e){}}
+      if(!txt){txt='{"cols":[],"items":[]}';setTimeout(()=>{const v=document.getElementById("vList");if(v)v.innerHTML='<div class="card"><h3>Load your private saves</h3><p>Your 4,141 Instagram saves aren\'t in this app yet. Tap ⚙ → <b>Import my saves file</b> and choose <b>jarmoo-saves.json</b>. They stay on this device only.</p></div>'},800)}
+      return new Response(txt,{headers:{"content-type":"application/json"}});
+    }
+    return _fetch(u,o);
+  };
+
+  /* --- AI brain via your own Anthropic API key (optional) --- */
+  function makeSample(){
+    const key=LS.get("jm_api_key","");if(!key)return null;
+    const model=LS.get("jm_model","claude-sonnet-5-5");
+    async function blobToB64(b){const buf=new Uint8Array(await b.arrayBuffer());let s="";for(let i=0;i<buf.length;i+=0x8000)s+=String.fromCharCode.apply(null,buf.subarray(i,i+0x8000));return btoa(s)}
+    async function call(body){
+      const r=await _fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify(body)});
+      if(r.status===429)throw{code:"rate_limited",message:"rate limited"};
+      if(r.status===401||r.status===403)throw{code:"not_granted",message:"API key rejected"};
+      if(!r.ok){let t="";try{t=(await r.json()).error.message}catch(e){}throw{code:"error",message:t||("HTTP "+r.status)}}
+      return r.json();
+    }
+    async function streamCall(body,onText){
+      const r=await _fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify(Object.assign({},body,{stream:true}))});
+      if(r.status===429)throw{code:"rate_limited",message:"rate limited"};
+      if(r.status===401||r.status===403)throw{code:"not_granted",message:"API key rejected"};
+      if(!r.ok||!r.body){let t="";try{t=(await r.json()).error.message}catch(e){}throw{code:"error",message:t||("HTTP "+r.status)}}
+      const rd=r.body.getReader(),dec=new TextDecoder();let buf="",stop=null;const blocks=[];
+      const liveText=()=>blocks.filter(x=>x&&x.type==="text").map(x=>x.text).join("");
+      for(;;){
+        const {value,done}=await rd.read();if(done)break;
+        buf+=dec.decode(value,{stream:true});let k;
+        while((k=buf.indexOf("\n\n"))>=0){
+          const chunk=buf.slice(0,k);buf=buf.slice(k+2);
+          const line=chunk.split("\n").find(l=>l.startsWith("data:"));if(!line)continue;
+          let ev;try{ev=JSON.parse(line.slice(5))}catch(e){continue}
+          if(ev.type==="content_block_start"){const cb=Object.assign({},ev.content_block);if(cb.type==="text")cb.text=cb.text||"";if(cb.type==="tool_use")cb._j="";blocks[ev.index]=cb}
+          else if(ev.type==="content_block_delta"){const cb=blocks[ev.index];if(!cb)continue;if(ev.delta.type==="text_delta"){cb.text+=ev.delta.text;onText(liveText())}else if(ev.delta.type==="input_json_delta")cb._j+=ev.delta.partial_json}
+          else if(ev.type==="message_delta"&&ev.delta&&ev.delta.stop_reason)stop=ev.delta.stop_reason;
+          else if(ev.type==="error")throw{code:"error",message:(ev.error&&ev.error.message)||"stream error"};
+        }
+      }
+      const content=blocks.filter(Boolean).map(cb=>{if(cb.type==="tool_use"){let inp={};try{inp=cb._j?JSON.parse(cb._j):{}}catch(e){}return{type:"tool_use",id:cb.id,name:cb.name,input:inp}}return{type:"text",text:cb.text}});
+      return{content,stop_reason:stop};
+    }
+    async function sample(input,opts={}){
+      let msgs=typeof input==="string"?[{role:"user",content:input}]:input.map(m=>({role:m.role,content:m.content}));
+      if(opts.images&&opts.images.length){
+        const last=msgs[msgs.length-1];const blocks=[];
+        for(const im of opts.images)blocks.push({type:"image",source:{type:"base64",media_type:im.type||"image/png",data:await blobToB64(im)}});
+        blocks.push({type:"text",text:typeof last.content==="string"?last.content:JSON.stringify(last.content)});last.content=blocks;
+      }
+      const fast=opts.modelTier==="quick"&&LS.get("jm_fast","1")!=="0";
+      const mdl=fast?"claude-haiku-5-5":model,maxT=fast?700:2500;
+      const tools=(opts.tools||[]).map(t=>({name:t.name,description:t.description,input_schema:t.inputSchema||{type:"object",properties:{}}}));
+      const byName=Object.fromEntries((opts.tools||[]).map(t=>[t.name,t]));
+      let prior="";
+      for(let step=0;step<8;step++){
+        const body={model:mdl,max_tokens:maxT,messages:msgs};if(tools.length)body.tools=tools;
+        const res=opts.onText?await streamCall(body,t=>opts.onText({text:prior+t,delta:""})):await call(body);
+        const text=(res.content||[]).filter(c=>c.type==="text").map(c=>c.text).join("");
+        const uses=(res.content||[]).filter(c=>c.type==="tool_use");
+        if(res.stop_reason!=="tool_use"||!uses.length){const all=prior+text;if(opts.onText)opts.onText({text:all,delta:""});return{text:all,truncated:res.stop_reason==="max_tokens"}}
+        if(text)prior+=text+(/[.!?]\s*$/.test(text)?" ":". ");
+        msgs.push({role:"assistant",content:res.content});
+        const results=[];
+        for(const u of uses){let out;try{out=await byName[u.name].execute(u.input||{})}catch(e){out={error:String(e&&e.message||e)}}results.push({type:"tool_result",tool_use_id:u.id,content:JSON.stringify(out).slice(0,20000)})}
+        msgs.push({role:"user",content:results});
+      }
+      return{text:prior||"(stopped after several tool steps)",truncated:true};
+    }
+    sample.json=async(input,opts={})=>{const r=await sample(input,opts);const t=r.text;return JSON.parse(t.slice(t.indexOf("{"),t.lastIndexOf("}")+1))};
+    sample.limits=async()=>({images:true});
+    return sample;
+  }
+
+  /* --- voice input: browser speech recognition --- */
+  function makeDictation(){
+    const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return null;
+    const H={p:[],f:[],s:[]};let rec=null,denied=false;
+    return{
+      onPartial:f=>H.p.push(f),onFinal:f=>H.f.push(f),onState:f=>H.s.push(f),
+      start(opts){try{rec&&rec.abort()}catch(e){}rec=new SR();rec.lang=LS.get("jm_lang","en-US");rec.interimResults=true;rec.continuous=!!(opts&&opts.continuous);
+        rec.onstart=()=>H.s.forEach(f=>f({state:"listening"}));
+        rec.onresult=e=>{let fin="",part="";for(let i=e.resultIndex;i<e.results.length;i++){const r=e.results[i];if(r.isFinal)fin+=r[0].transcript;else part+=r[0].transcript}if(part)H.p.forEach(f=>f({text:part}));if(fin)H.f.forEach(f=>f({text:fin}))};
+        rec.onerror=e=>{if(e.error==="not-allowed"||e.error==="service-not-allowed"){denied=true}};
+        rec.onend=()=>H.s.forEach(f=>f({state:"idle",reason:denied?"not_granted":"stopped"}));
+        if(denied)return Promise.reject({code:"not_granted"});
+        try{rec.start()}catch(e){return Promise.reject({code:"dismissed"})}return Promise.resolve()},
+      stop(){try{rec&&rec.stop()}catch(e){}return Promise.resolve()}
+    };
+  }
+
+  /* --- spoken replies: browser speech synthesis --- */
+  function makeTTS(){
+    if(!("speechSynthesis" in window))return null;const S=[];
+    return{
+      onState:f=>S.push(f),
+      speak(text){return new Promise((res,rej)=>{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(String(text));const lang=LS.get("jm_lang","en-US");u.lang=lang;const v=speechSynthesis.getVoices().find(v=>v.lang&&v.lang.startsWith(lang.slice(0,2)));if(v)u.voice=v;u.rate=1;
+        u.onstart=()=>S.forEach(f=>f({state:"speaking"}));u.onend=()=>{S.forEach(f=>f({state:"idle",reason:"completed"}));res()};u.onerror=()=>{S.forEach(f=>f({state:"idle",reason:"error"}));rej({code:"error"})};speechSynthesis.speak(u)})},
+      stop(){speechSynthesis.cancel()}
+    };
+  }
+
+  /* --- downloads --- */
+  const downloads={save:async({filename,data})=>{const a=document.createElement("a");a.href=URL.createObjectURL(data instanceof Blob?data:new Blob([data],{type:"text/plain"}));a.download=filename;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},2000)}};
+
+  const caps={sample:makeSample(),dictation:makeDictation(),tts:makeTTS(),downloads,db:null,user:null};
+  window.claude={use:async n=>(n in caps)?caps[n]:null};
+
+  /* --- real system notifications (work while the browser is open, even minimised) --- */
+  window.jmNotify=async(title,body)=>{try{if(!("Notification" in window)||Notification.permission!=="granted")return;const reg=navigator.serviceWorker&&await navigator.serviceWorker.getRegistration();if(reg){reg.showNotification(title,{body,tag:"jarmoo-"+Date.now(),icon:"icon-192.png",badge:"icon-192.png",vibrate:[200,100,200]})}else new Notification(title,{body,tag:"jarmoo-"+Date.now()})}catch(e){}};
+  if("serviceWorker" in navigator&&/^https:|^http:\/\/(localhost|127\.0\.0\.1)/.test(location.href)&&!document.getElementById("vaultdata")){window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}))}
+  let deferredInstall=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();deferredInstall=e;const b=document.getElementById("jmInstall");if(b)b.style.display=""});
+
+  /* --- settings panel --- */
+  function backup(){const keys=["jv_notes","jv_trades","jv_best","jv_al","jv_tts"];const o={app:"Jarmoo",when:new Date().toISOString()};keys.forEach(k=>o[k]=LS.get(k,null));return JSON.stringify(o,null,1)}
+  function ui(){
+    const css=document.createElement("style");css.textContent=`#jmSet{position:fixed;inset:0;background:rgba(2,6,12,.75);display:none;z-index:50;align-items:flex-start;justify-content:center;overflow:auto;padding:30px 12px}#jmSet.on{display:flex}#jmSet .box{background:var(--panel);border:1px solid var(--line);border-radius:16px;max-width:620px;width:100%;padding:20px}#jmSet h3{margin:16px 0 6px}#jmSet label{display:block;font-size:12.5px;color:var(--mut);margin:8px 0 4px}#jmGear{position:fixed;right:16px;bottom:16px;z-index:40;border-radius:50%;width:52px;height:52px;border:1px solid var(--cy2);background:var(--panel2);color:var(--cy);font-size:22px;box-shadow:0 0 20px rgba(51,214,255,.25)}`;document.head.appendChild(css);
+    const g=document.createElement("button");g.id="jmGear";g.title="Jarmoo settings";g.textContent="⚙";document.body.appendChild(g);
+    const m=document.createElement("div");m.id="jmSet";
+    const notif="Notification" in window?Notification.permission:"unsupported";
+    m.innerHTML=`<div class="box"><div class="row" style="justify-content:space-between"><h2>JARMOO SETTINGS</h2><button class="btn ghost" id="jmClose">✕</button></div>
+      <p class="hint">Standalone edition: runs on this device with no Claude account. Your notes, trades and settings stay in this browser. Hands-free voice: tap the core on the home screen, then say “Jarmoo, …”.</p>
+      <h3>🧠 AI brain (optional)</h3>
+      <p class="hint">Without a key, Jarmoo still answers from your library, forex engine and 4,141 saves. With your own Anthropic API key (console.anthropic.com, pay-as-you-go), you get full AI chat, the formula builder, AI chart analysis and vault Q&A. The key is stored only in this browser and is sent only to api.anthropic.com.</p>
+      <label>Anthropic API key</label><input type="password" id="jmKey" placeholder="sk-ant-…" value="">
+      <label>Model</label><select id="jmModel"><option value="claude-sonnet-5-5">Claude Sonnet 5.5 (recommended)</option><option value="claude-haiku-5-5">Claude Haiku 5.5 (cheapest)</option><option value="claude-opus-5-5">Claude Opus 5.5 (smartest)</option></select>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="jmFast" style="width:auto"> Fast voice replies (Claude Haiku 5.5 in hands-free mode, about 2× quicker)</label>
+      <div class="row" style="margin-top:8px"><button class="btn" id="jmSaveKey">Save & restart</button><button class="btn ghost" id="jmDelKey">Remove key</button><span class="hint" id="jmKeyState"></span></div>
+      <h3>🎙 Voice</h3><label>Voice language (speaking & listening)</label><select id="jmLang"><option value="en-US">English</option><option value="sw-TZ">Kiswahili (Tanzania)</option><option value="en-GB">English (UK)</option></select>
+      <h3>🔔 Notifications</h3><p class="hint">Allow system pop-ups for London open, overlap and NFP alerts. They work while the browser is open, even when it is minimised. Status: <b id="jmNs">${notif}</b></p><button class="btn ghost" id="jmNotif">Enable notifications</button> <button class="btn ghost" id="jmTest">Test</button>
+      <h3>📲 Install as an app</h3><p class="hint">Installs Jarmoo with its own icon. Works when Jarmoo is opened from its web address (https). The single-file version opens from your computer instead.</p><button class="btn" id="jmInstall" style="display:none">Install Jarmoo app</button>
+      <h3>🗂 Your Instagram saves</h3><p class="hint">Status: <b id="jmVs">checking…</b>. The installed app doesn't contain your private saves until you import <b>jarmoo-saves.json</b> once. It stays on this device.</p><label class="btn ghost" style="margin:0;cursor:pointer;display:inline-block">Import my saves file<input type="file" id="jmVault" accept=".json" style="display:none"></label>
+      <h3>💾 Backup / move to another device</h3><p class="hint">Export your notes, journal and settings, then import them on your phone or another computer.</p>
+      <div class="row"><button class="btn ghost" id="jmExp">Export backup</button><label class="btn ghost" style="margin:0;cursor:pointer">Import backup<input type="file" id="jmImp" accept=".json" style="display:none"></label></div>
+      <p class="hint" style="margin-top:16px">Jarmoo standalone · built ${new Date(document.lastModified).toLocaleDateString()} · forex timings are computed on your device · educational, not financial advice.</p></div>`;
+    document.body.appendChild(m);
+    const $=s=>m.querySelector(s);
+    $("#jmModel").value=LS.get("jm_model","claude-sonnet-5-5");$("#jmLang").value=LS.get("jm_lang","en-US");
+    $("#jmKeyState").textContent=LS.get("jm_api_key","")?"✔ key saved, AI brain ON":"No key: offline brain";
+    g.onclick=()=>m.classList.add("on");$("#jmClose").onclick=()=>m.classList.remove("on");m.onclick=e=>{if(e.target===m)m.classList.remove("on")};
+    $("#jmSaveKey").onclick=()=>{const k=$("#jmKey").value.trim();if(k)LS.set("jm_api_key",k);LS.set("jm_model",$("#jmModel").value);location.reload()};
+    $("#jmDelKey").onclick=()=>{try{localStorage.removeItem("jm_api_key")}catch(e){}location.reload()};
+    $("#jmModel").onchange=()=>LS.set("jm_model",$("#jmModel").value);
+    $("#jmFast").checked=LS.get("jm_fast","1")!=="0";$("#jmFast").onchange=e=>LS.set("jm_fast",e.target.checked?"1":"0");
+    $("#jmLang").onchange=()=>LS.set("jm_lang",$("#jmLang").value);
+    $("#jmNotif").onclick=async()=>{if(!("Notification" in window)){$("#jmNs").textContent="not supported in this browser";return}const p=await Notification.requestPermission();$("#jmNs").textContent=p};
+    $("#jmTest").onclick=()=>window.jmNotify("Jarmoo","Notifications are working, Sir.");
+    $("#jmExp").onclick=()=>downloads.save({filename:"Jarmoo-backup-"+new Date().toISOString().slice(0,10)+".json",data:new Blob([backup()],{type:"application/json"})});
+    $("#jmImp").onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const o=JSON.parse(await f.text());Object.keys(o).forEach(k=>{if(k.startsWith("jv_")&&o[k]!==null)LS.set(k,o[k])});location.reload()}catch(err){$("#jmNs").textContent="Backup file not valid"}};
+    const vs=$("#jmVs");if(document.getElementById("vaultdata"))vs.textContent="built into this file ✔";else idbGet("vault").then(v=>{vs.textContent=v?"imported ✔":"not imported yet"}).catch(()=>{vs.textContent="not imported yet"});
+    $("#jmVault").onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const t=await f.text();const o=JSON.parse(t);if(!o.items||!o.cols)throw 0;await idbSet("vault",t);vs.textContent="imported ✔ ("+o.items.length+" posts)";setTimeout(()=>location.reload(),600)}catch(err){vs.textContent="That isn't a Jarmoo saves file"}};
+    $("#jmInstall").onclick=async()=>{if(deferredInstall){deferredInstall.prompt();deferredInstall=null}};if(deferredInstall)$("#jmInstall").style.display="";
+    const foot=document.querySelector(".side-foot");if(foot)foot.innerHTML+=`<br><br><b>Standalone edition</b>: works without Claude. ⚙ Settings (bottom right) for AI key, voice, notifications and backup.`;
+  }
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",ui);else ui();
+})();
+
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#060b14;--panel:#0b1322;--panel2:#0f1a2e;--line:#1b2a44;--txt:#d9e6f5;--mut:#7f93ad;
+  --cy:#33d6ff;--cy2:#0fa3c9;--gold:#ffb547;--ok:#3ddc97;--bad:#ff5d6c;
+  --r:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.5 Inter,system-ui,sans-serif}
+body{background:radial-gradient(1200px 600px at 70% -10%,#0d2440 0%,transparent 60%),var(--bg);min-height:100vh}
+a{color:var(--cy)}
+button{font:inherit;cursor:pointer}
+.mono{font-family:"JetBrains Mono",monospace}
+.app{display:grid;grid-template-columns:230px 1fr;min-height:100vh}
+nav{border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;overflow:auto;background:rgba(6,11,20,.7)}
+.brand{font-family:Orbitron;font-weight:700;letter-spacing:.18em;color:var(--cy);font-size:18px;padding:4px 10px 2px}
+.brand small{display:block;font-family:Inter;letter-spacing:.02em;color:var(--mut);font-size:12px;font-weight:400;margin-top:2px}
+.navlist{margin-top:18px;display:flex;flex-direction:column;gap:2px}
+.navlist button{display:flex;align-items:center;gap:10px;background:none;border:0;color:var(--mut);padding:9px 10px;border-radius:10px;text-align:left;width:100%}
+.navlist button:hover{background:var(--panel);color:var(--txt)}
+.navlist button.on{background:linear-gradient(90deg,rgba(51,214,255,.16),rgba(51,214,255,.02));color:var(--cy)}
+.navlist .ic{width:22px;text-align:center}
+.side-foot{margin-top:18px;padding:10px;border:1px solid var(--line);border-radius:12px;color:var(--mut);font-size:12px}
+main{padding:22px 28px 60px;max-width:1150px;width:100%}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.greet h1{font-family:Orbitron;font-size:22px;margin:0;letter-spacing:.04em}
+.greet p{margin:2px 0 0;color:var(--mut)}
+.pills{display:flex;gap:8px;flex-wrap:wrap}
+.pill{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:7px 14px;font-size:13px;color:var(--mut);display:flex;gap:8px;align-items:center}
+.pill b{color:var(--txt);font-weight:600}
+.pill button{background:none;border:0;color:var(--cy);padding:0}
+section.mod{display:none;animation:fade .25s ease}
+section.mod.on{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+h2{font-family:Orbitron;font-size:17px;letter-spacing:.06em;margin:0 0 4px}
+.sub{color:var(--mut);margin:0 0 16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(270px,1fr))}
+.grid.tight{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:rgba(51,214,255,.1);color:var(--cy);margin-right:4px}
+.tag.g{background:rgba(255,181,71,.12);color:var(--gold)}
+.code{position:relative;background:#050a12;border:1px solid var(--line);border-radius:10px;padding:10px 64px 10px 12px;margin:8px 0 0;font-family:"JetBrains Mono",monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;color:#bfefff}
+.copy{position:absolute;top:6px;right:6px;background:var(--panel2);border:1px solid var(--line);color:var(--mut);border-radius:7px;font-size:11px;padding:3px 8px}
+.copy:hover{color:var(--cy)}
+.card h3{margin:0 0 4px;font-size:15px}
+.card p{margin:0;color:var(--mut);font-size:13.5px}
+input,textarea,select{font:inherit;background:#050a12;border:1px solid var(--line);color:var(--txt);border-radius:10px;padding:10px 12px;width:100%}
+input:focus,textarea:focus{outline:2px solid rgba(51,214,255,.35);border-color:var(--cy2)}
+.btn{background:linear-gradient(180deg,#19c3ef,#0b93b8);border:0;color:#02131c;font-weight:600;border-radius:10px;padding:10px 16px}
+.btn.ghost{background:var(--panel2);color:var(--txt);border:1px solid var(--line);font-weight:500}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.search{margin-bottom:14px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.chip{background:var(--panel);border:1px solid var(--line);color:var(--mut);border-radius:999px;padding:6px 12px;font-size:13px}
+.chip.on{border-color:var(--cy2);color:var(--cy);background:rgba(51,214,255,.08)}
+
+/* HOME / CONSOLE */
+.console{display:grid;grid-template-columns:260px 1fr;gap:18px}
+.reactor-wrap{display:flex;flex-direction:column;align-items:center;gap:12px;padding-top:6px}
+.reactor{width:200px;height:200px;border-radius:50%;position:relative;display:grid;place-items:center;border:0;background:none;padding:0}
+.reactor .ring{position:absolute;inset:0;border-radius:50%;border:2px solid rgba(51,214,255,.25)}
+.reactor .ring.r2{inset:16px;border:2px dashed rgba(51,214,255,.35);animation:spin 18s linear infinite}
+.reactor .ring.r3{inset:34px;border:6px solid transparent;border-top-color:var(--cy);border-bottom-color:var(--cy);animation:spin 6s linear infinite reverse;opacity:.7}
+.reactor .core{width:84px;height:84px;border-radius:50%;background:radial-gradient(circle,#c9f6ff 0%,#33d6ff 35%,#0a6f8f 70%,transparent 72%);box-shadow:0 0 40px rgba(51,214,255,.55);display:grid;place-items:center;color:#02131c;font-size:28px}
+.reactor.listen .core{animation:pulse 1s ease-in-out infinite}
+.reactor.think .r3{animation-duration:1.2s}
+.reactor.speak .core{box-shadow:0 0 70px rgba(255,181,71,.6);background:radial-gradient(circle,#fff1d6 0%,#ffb547 40%,#8f5a0a 70%,transparent 72%)}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{50%{transform:scale(1.12);box-shadow:0 0 80px rgba(51,214,255,.8)}}
+.hfopts{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--mut)}.hfopts label{display:flex;gap:6px;align-items:center}.hfopts input{width:auto}
+#hfBtn.on{background:linear-gradient(180deg,#ffcf7a,#e99a1c)}
+.state{font-family:Orbitron;font-size:12px;letter-spacing:.2em;color:var(--cy)}
+.chat{display:flex;flex-direction:column;height:520px}
+.log{flex:1;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:4px 4px 10px}
+.msg{max-width:88%;padding:10px 14px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+.msg.u{align-self:flex-end;background:#13314d;border:1px solid #1d4a70}
+.msg.j{align-self:flex-start;background:var(--panel2);border:1px solid var(--line)}
+.msg.j b.who{display:block;font-family:Orbitron;font-size:10px;letter-spacing:.2em;color:var(--cy);margin-bottom:2px}
+.msg code{font-family:"JetBrains Mono";background:#050a12;padding:1px 5px;border-radius:5px;font-size:12.5px}
+.inbar{display:flex;gap:8px;margin-top:8px}
+.inbar input{flex:1}
+.ibtn{width:44px;height:44px;flex:0 0 44px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);color:var(--txt);font-size:18px}
+.ibtn.on{border-color:var(--cy);color:var(--cy);box-shadow:0 0 0 3px rgba(51,214,255,.15)}
+.quick{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.quick button{background:none;border:1px solid var(--line);color:var(--mut);border-radius:999px;padding:5px 11px;font-size:12.5px}
+.quick button:hover{color:var(--cy);border-color:var(--cy2)}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:18px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+.stat b{display:block;font-family:Orbitron;font-size:22px;color:var(--cy)}
+.stat span{color:var(--mut);font-size:12.5px}
+
+/* typing */
+.typebox{font-family:"JetBrains Mono";font-size:18px;line-height:1.8;background:#050a12;border:1px solid var(--line);border-radius:12px;padding:16px;min-height:120px}
+.typebox .ok{color:var(--ok)}.typebox .bad{color:var(--bad);text-decoration:underline}.typebox .cur{border-left:2px solid var(--cy)}
+.typebox .rest{color:#4d6380}
+/* keys */
+kbd{font-family:"JetBrains Mono";font-size:12px;background:#0a1424;border:1px solid #2a3d5d;border-bottom-width:3px;border-radius:6px;padding:2px 7px;color:#e8f6ff;white-space:nowrap}
+.sc{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:9px 0;border-bottom:1px dashed var(--line)}
+.sc:last-child{border:0}
+.sc span{color:var(--txt);font-size:14px}
+.quiz{font-size:20px;text-align:center;padding:26px 10px}
+.meter{height:8px;border-radius:99px;background:#0a1424;overflow:hidden;margin:10px 0}
+.meter i{display:block;height:100%;width:0;transition:width .3s}
+.note{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--line)}
+.note p{flex:1;margin:0;white-space:pre-wrap}
+.note.done p{text-decoration:line-through;color:var(--mut)}
+.note small{color:var(--mut);display:block;font-size:11.5px}
+.note button{background:none;border:0;color:var(--mut)}
+.hint{color:var(--mut);font-size:12.5px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--cy2);color:var(--txt);padding:9px 16px;border-radius:10px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
+.toast.on{opacity:1}
+.warn{border-left:3px solid var(--gold);padding:8px 12px;background:rgba(255,181,71,.06);border-radius:6px;color:#f1d7a8;font-size:13px;margin:10px 0}
+
+.fxp{display:none}.fxp.on{display:block;animation:fade .25s ease}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.fgrid label{font-size:12.5px;color:var(--mut);display:flex;flex-direction:column;gap:4px}
+.tl{position:relative;margin-top:10px;padding-top:18px}
+.tl .row2{display:flex;align-items:center;gap:8px;height:26px;margin-bottom:6px}
+.tl .lab{width:92px;font-size:12px;color:var(--mut);flex:0 0 92px}
+.tl .bar{position:relative;flex:1;height:18px;background:#08111f;border-radius:6px;border:1px solid var(--line)}
+.tl .band{position:absolute;top:0;bottom:0;border-radius:5px;opacity:.85}
+.tl .hours{position:absolute;left:100px;right:0;top:0;height:14px;font-size:10px;color:#56708f}
+.tl .hours span{position:absolute;transform:translateX(-50%)}
+.tl .nowline{position:absolute;top:14px;bottom:0;width:2px;background:var(--gold);box-shadow:0 0 8px var(--gold)}
+.big{font-family:Orbitron;font-size:26px;color:var(--cy)}
+.kv{display:grid;grid-template-columns:1fr auto;gap:6px 14px;font-size:14px}
+.kv b{color:var(--txt);text-align:right;font-family:"JetBrains Mono"}
+.kv span{color:var(--mut)}
+.grade{font-family:Orbitron;font-size:44px;line-height:1}
+.ck{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px dashed var(--line)}
+.ck input{width:18px;height:18px;margin-top:2px;flex:0 0 18px}
+.ck small{display:block;color:var(--mut)}
+.pl h3{display:flex;justify-content:space-between;gap:8px}
+.pl ul{margin:6px 0 0;padding-left:18px;color:#c9d7ea;font-size:13.5px}
+.pl li{margin:3px 0}
+.ev{font-size:11px;padding:2px 8px;border-radius:99px;white-space:nowrap;align-self:flex-start}
+.ev.s{background:rgba(61,220,151,.14);color:var(--ok)}.ev.m{background:rgba(255,181,71,.14);color:var(--gold)}.ev.w{background:rgba(255,93,108,.14);color:var(--bad)}
+.post{padding:10px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.post .meta{display:flex;gap:8px;align-items:center;margin-bottom:3px;font-size:12px;color:var(--mut)}
+.post p{margin:0;color:#c9d7ea;white-space:pre-wrap;word-break:break-word}
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}.tbl td,.tbl th{padding:7px 6px;border-bottom:1px solid var(--line);text-align:left}.tbl th{color:var(--mut);font-weight:500;font-size:12px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+@media (max-width:860px){
+  .fgrid{grid-template-columns:1fr}
+  #m-forex .grid{grid-template-columns:1fr!important}
+  .app{grid-template-columns:1fr}
+  nav{position:sticky;top:0;height:auto;z-index:5;padding:10px;border-right:0;border-bottom:1px solid var(--line);background:#060b14}
+  .navlist{flex-direction:row;overflow-x:auto;margin-top:8px}
+  .navlist button{white-space:nowrap;width:auto}
+  .side-foot,.brand small{display:none}
+  main{padding:16px}
+  .console{grid-template-columns:1fr}
+  .reactor{width:150px;height:150px}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .chat{height:460px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+<nav>
+  <div class="brand">JARMOO<small>Moses's personal system</small></div>
+  <div class="navlist" id="nav"></div>
+  <div class="side-foot">Fed with all <b>4,141</b> of your Instagram saves (42 collections). Forex first. Try <i>"good time to trade gold?"</i>, <i>"note …"</i>, <i>"focus 25"</i>.</div>
+</nav>
+<main>
+  <div class="topbar">
+    <div class="greet"><h1 id="hello">Good day, Moses</h1><p id="today"></p></div>
+    <div class="pills">
+      <div class="pill">🕒 <b id="clock" class="mono">--:--:--</b> EAT</div>
+      <div class="pill">🎯 Focus <b id="focusT" class="mono">25:00</b> <button id="focusBtn">Start</button> <button id="focusReset" title="Reset">↺</button></div>
+    </div>
+  </div>
+
+  <!-- HOME -->
+  <section class="mod on" id="m-home">
+    <div class="console">
+      <div class="reactor-wrap">
+        <button class="reactor" id="reactor" aria-label="Talk to Jarmoo"><span class="ring"></span><span class="ring r2"></span><span class="ring r3"></span><span class="core">🎙</span></button>
+        <div class="state" id="state">STANDING BY</div>
+        <div class="hint" id="voiceHint" style="text-align:center">Tap the core for hands-free mode</div>
+        <button class="btn" id="hfBtn" style="width:100%">🎧 Start hands-free</button>
+        <div class="hfopts"><label><input type="checkbox" id="hfWake" checked> Only respond after “Jarmoo”</label><label><input type="checkbox" id="hfAuto"> Start hands-free when I open Jarmoo</label></div>
+      </div>
+      <div class="card chat">
+        <div class="log" id="log"></div>
+        <form class="inbar" id="askForm">
+          <button type="button" class="ibtn" id="micBtn" title="Speak">🎙</button>
+          <input id="ask" placeholder="Ask Jarmoo anything… e.g. “formula for age from date of birth”" autocomplete="off">
+          <button type="button" class="ibtn" id="ttsBtn" title="Spoken replies">🔈</button>
+          <button class="btn" type="submit">Send</button>
+        </form>
+        <div class="quick" id="quick"></div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b id="sx">0</b><span>Excel tricks loaded</span></div>
+      <div class="stat"><b id="sp">0</b><span>PC commands</span></div>
+      <div class="stat"><b id="ss">0</b><span>Shortcuts</span></div>
+      <div class="stat"><b id="sa">0</b><span>AI & web tools</span></div>
+    </div>
+  </section>
+
+  <!-- FOREX -->
+  <section class="mod" id="m-forex">
+    <h2>FOREX COMMAND CENTER</h2>
+    <p class="sub">Built from your <b>66 saved forex posts</b> plus researched evidence. Session times are worked out live in <b>EAT (Dar es Salaam)</b>, with risk measured as a % of your account.</p>
+    <div class="chips" id="fxTabs"></div>
+
+    <div class="fxp" id="fx-sessions">
+      <div class="grid" style="grid-template-columns:1.2fr 1fr">
+        <div class="card"><span class="tag">LIVE · EAT</span><h3 style="margin-top:6px;font-size:20px" id="fxNow">—</h3><p id="fxNowSub">—</p><div id="fxNext" class="hint" style="margin-top:8px"></div></div>
+        <div class="card"><h3>🔔 Session alerts</h3><p>Jarmoo speaks and flashes an alert while this page is open.</p>
+          <div id="fxAlerts" style="margin-top:8px;display:grid;gap:6px"></div>
+          <div class="row" style="margin-top:8px"><span class="hint">Warn me</span><select id="fxLead" style="width:auto"><option value="5">5 min</option><option value="15" selected>15 min</option><option value="30">30 min</option></select><span class="hint">before</span></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3 id="fxClockT">Today's market clock (EAT)</h3><div id="fxTimeline" class="tl"></div></div>
+      <div class="grid" style="margin-top:12px;grid-template-columns:1fr 1fr">
+        <div class="card"><h3>Sessions in your time</h3><div id="fxTable"></div></div>
+        <div class="card"><h3>📅 Your trading day plan</h3><div id="fxPlan"></div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>📰 News danger zones</h3><div id="fxNews"></div>
+        <p style="margin-top:8px"><a href="https://www.forexfactory.com/calendar" target="_blank" rel="noopener">Forex Factory calendar ↗</a> · <a href="https://www.investing.com/economic-calendar/" target="_blank" rel="noopener">Investing.com calendar ↗</a> · <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView (set price alerts) ↗</a></p></div>
+    </div>
+
+    <div class="fxp" id="fx-risk">
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        <div class="card"><h3>🧮 Position size & risk calculator</h3>
+          <div class="fgrid">
+            <label>Account balance (USD)<input id="rBal" type="number" value="1000" min="0" step="any"></label>
+            <label>Risk per trade (%)<input id="rPct" type="number" value="1" min="0.1" step="0.1"></label>
+            <label>Instrument<select id="rSym"></select></label>
+            <label>Direction<select id="rDir"><option value="1">Buy (long)</option><option value="-1">Sell (short)</option></select></label>
+            <label>Entry price<input id="rEntry" type="number" step="any" placeholder="e.g. 1.08500"></label>
+            <label>Stop-loss price<input id="rStop" type="number" step="any" placeholder="e.g. 1.08300"></label>
+            <label id="rPipsL">…or stop in pips<input id="rPips" type="number" step="any" placeholder="e.g. 20"></label>
+            <label id="rRateL">USDJPY rate (for JPY crosses)<input id="rRate" type="number" step="any" placeholder="e.g. 152.40"></label>
+            <label id="rContL">Contract size per lot<input id="rCont" type="number" step="any" value="100"></label>
+            <label>Daily max loss (%)<input id="rDaily" type="number" value="3" step="0.5"></label>
+            <label>USD→TZS rate (optional)<input id="rTzs" type="number" step="any" placeholder="today's rate"></label>
+            <label>Leverage (optional)<input id="rLev" type="number" step="any" placeholder="e.g. 100"></label>
+          </div>
+        </div>
+        <div class="card"><h3>Result</h3><div id="rOut"><p class="hint">Fill in balance, risk and stop.</p></div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>📉 Recovery math: why small risk wins</h3><div class="grid tight" id="rDD"></div></div>
+    </div>
+
+    <div class="fxp" id="fx-check">
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        <div class="card"><h3>✅ Entry checklist (A+ setups only)</h3><p>Tick only what is true <b>right now</b>. Jarmoo grades the setup and tells you how much to risk.</p><div id="ckList" style="margin-top:10px"></div></div>
+        <div class="card"><h3>Verdict</h3><div id="ckOut"></div></div>
+      </div>
+    </div>
+
+    <div class="fxp" id="fx-ai">
+      <div class="card"><h3>🤖 AI chart analyst</h3><p>Upload a screenshot of your chart (MT5 or TradingView, ideally with the higher timeframe as well). Jarmoo reads the structure and levels and gives a plan with entry, stop and targets, sized to your risk.</p>
+        <div class="fgrid" style="margin-top:10px">
+          <label>Chart image(s)<input id="aiImg" type="file" accept="image/*" multiple></label>
+          <label>Pair & timeframe<input id="aiPair" placeholder="e.g. XAUUSD H1"></label>
+          <label style="grid-column:1/-1">Your idea / question (optional)<input id="aiQ" placeholder="e.g. Is this a buy after the sweep of Asian low?"></label>
+        </div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="aiGo">Analyze chart</button><span class="hint" id="aiNote"></span></div>
+        <div id="aiOut" style="margin-top:12px"></div>
+      </div>
+    </div>
+
+    <div class="fxp" id="fx-play"><div class="grid" id="playList"></div></div>
+
+    <div class="fxp" id="fx-journal">
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        <div class="card"><h3>📓 Log a trade</h3>
+          <form id="jForm" class="fgrid">
+            <label>Pair<input id="jPair" placeholder="XAUUSD" required></label>
+            <label>Direction<select id="jDir"><option>Buy</option><option>Sell</option></select></label>
+            <label>Setup<select id="jSetup"></select></label>
+            <label>Risk %<input id="jRisk" type="number" step="0.1" value="1"></label>
+            <label>Result (R)<input id="jR" type="number" step="0.1" placeholder="+2 win · -1 loss" required></label>
+            <label>P/L (USD)<input id="jPL" type="number" step="any"></label>
+            <label style="grid-column:1/-1">Notes / emotions<input id="jNote" placeholder="Followed plan? FOMO? Revenge?"></label>
+            <button class="btn" style="grid-column:1/-1">Save trade</button>
+          </form>
+        </div>
+        <div class="card"><h3>Performance</h3><div id="jStats"></div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>History</h3><div id="jList"><p class="hint">No trades yet.</p></div></div>
+    </div>
+
+    <div class="fxp" id="fx-saves"><input class="search" id="fsQ" placeholder="Search your forex saves: gold, lot size, volume profile, news…"><div id="fsList"></div></div>
+
+    <div class="fxp" id="fx-safety"><div class="grid" id="safeList"></div></div>
+  </section>
+
+  <!-- VAULT -->
+  <section class="mod" id="m-vault">
+    <h2>LIFE VAULT</h2><p class="sub">All <b id="vCount">4,141</b> posts from your <b>42 saved collections</b> (health, knowledge, business, love, memories, faith, news and more). Jarmoo remembers all of them and can answer from them.</p>
+    <div class="card" style="margin-bottom:14px"><h3>🧠 Ask Jarmoo about your saves</h3>
+      <div class="row" style="margin-top:8px"><select id="vAskCol" style="width:auto;max-width:260px"><option value="">All collections</option></select><input id="vAsk" placeholder="e.g. Summarize the best health lessons I saved" style="flex:1"><button class="btn" id="vAskBtn">Ask</button></div>
+      <div class="quick" id="vQuick"></div><div id="vAns" style="margin-top:10px"></div></div>
+    <input class="search" id="vQ" placeholder="Search all saves…">
+    <div class="chips" id="vCols"></div>
+    <div id="vList"><p class="hint">Loading vault…</p></div>
+  </section>
+
+  <!-- VOICE STUDIO -->
+  <section class="mod" id="m-voice">
+    <h2>VOICE STUDIO</h2><p class="sub">Choose how Jarmoo sounds. Tap ▶ to hear a voice, then ✓ Use. Or just say <i>“Jarmoo, change voice to butler”</i>.</p>
+    <div class="grid" id="vsList"></div>
+    <div class="grid" style="margin-top:12px;grid-template-columns:1fr 1fr">
+      <div class="card"><h3>🎚 Fine-tune</h3>
+        <label class="hint" style="display:block;margin-top:8px">Speed <b id="vsRateV">1.00×</b></label><input type="range" id="vsRate" min="0.7" max="1.5" step="0.05" style="padding:0">
+        <label class="hint" style="display:block;margin-top:8px">Pitch <b id="vsPitchV">1.00×</b> <span>(device voices)</span></label><input type="range" id="vsPitch" min="0.5" max="1.5" step="0.05" style="padding:0">
+        <input id="vsTest" style="margin-top:10px" value="Good evening, Moses. Gold is quiet, London opens at eleven, and your risk is set at one percent.">
+        <div class="row" style="margin-top:8px"><button class="btn" id="vsSpeak">▶ Speak test</button><button class="btn ghost" id="vsStop">■ Stop</button><button class="btn ghost" id="vsReset">Reset</button></div>
+      </div>
+      <div class="card"><h3>🧩 Custom device voice</h3><p>Every voice installed on this phone or computer. Choose one, then ✓ Use on “Custom device voice”.</p>
+        <select id="vsCustom" style="margin-top:8px"></select>
+        <p class="hint" style="margin-top:8px">💡 Best free voices: open Jarmoo in <b>Microsoft Edge</b>. It has natural voices like <i>Ryan</i> and <i>Thomas</i> (British male, a great butler), <i>Sonia</i>, <i>Guy</i>, and Kiswahili <i>Rehema</i> and <i>Daudi</i>. On Windows you can add more under Settings → Time & language → Speech.</p>
+      </div>
+    </div>
+    <div class="card" id="vsEleven" style="margin-top:12px"></div>
+  </section>
+
+  <!-- EXCEL -->
+  <section class="mod" id="m-excel">
+    <h2>EXCEL LAB</h2><p class="sub">Every Excel trick from your saves, plus finance formulas for your work. Tap Copy and paste it into Excel.</p>
+    <input class="search" id="xq" placeholder="Search: age, hours, pdf, blanks, VAT, progress…">
+    <div class="card" style="margin-bottom:14px">
+      <h3>🧠 Formula Builder</h3>
+      <p>Describe what you need. Jarmoo writes the formula and explains it.</p>
+      <div class="row" style="margin-top:10px"><input id="xb" placeholder="e.g. Sum column D where column B is 'Fertilizer' and month is October" style="flex:1"><button class="btn" id="xbBtn">Build</button></div>
+      <div id="xbOut"></div>
+    </div>
+    <div class="grid" id="xlist"></div>
+  </section>
+
+  <!-- PC DOCTOR -->
+  <section class="mod" id="m-pc">
+    <h2>PC DOCTOR</h2><p class="sub">Speed up, repair, update and inspect your Windows PC. Run commands in <b>Terminal (Admin)</b>: press <kbd>Win</kbd>+<kbd>X</kbd> → Terminal (Admin).</p>
+    <div class="card" style="margin-bottom:14px">
+      <h3>⚡ Jarmoo PC Toolkit (one script, every fix)</h3>
+      <p>A menu-driven PowerShell script with the cleanup, repair, update, specs, battery, Wi-Fi and network tools below in one place.</p>
+      <div class="row" style="margin-top:10px"><button class="btn" id="dlPs">Download Jarmoo-Toolkit.ps1</button><button class="btn ghost" id="cpPs">Copy script</button></div>
+      <p class="hint" style="margin-top:8px">Run it: right-click the file → <i>Run with PowerShell</i>, or in Admin Terminal: <code class="mono">powershell -ExecutionPolicy Bypass -File .\Jarmoo-Toolkit.ps1</code></p>
+    </div>
+    <div class="chips" id="pcChips"></div>
+    <div class="grid" id="pclist"></div>
+  </section>
+
+  <!-- SHORTCUTS -->
+  <section class="mod" id="m-keys">
+    <h2>SHORTCUT TRAINER</h2><p class="sub">Windows, Excel, Word, PowerPoint, Tally Prime and Chrome. Learn them here, then test yourself.</p>
+    <div class="chips" id="kChips"></div>
+    <div class="grid" style="grid-template-columns:1fr 1fr" id="kwrap">
+      <div class="card" id="klist"></div>
+      <div class="card">
+        <h3>🎯 Quiz mode</h3><p>Jarmoo names an action. Say the keys in your head, then reveal the answer.</p>
+        <div class="quiz" id="kq">Press “Next” to start</div>
+        <div style="text-align:center;font-size:18px;min-height:34px" id="ka"></div>
+        <div class="row" style="justify-content:center;margin-top:10px"><button class="btn ghost" id="kReveal">Reveal</button><button class="btn" id="kNext">Next</button></div>
+        <p class="hint" style="text-align:center;margin-top:10px" id="kScore"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- TYPING -->
+  <section class="mod" id="m-type">
+    <h2>TYPING DOJO</h2><p class="sub">Your saves had four typing-speed videos. Train here. The timer starts on your first key.</p>
+    <div class="row" style="margin-bottom:12px">
+      <div class="pill">WPM <b id="wpm">0</b></div><div class="pill">Accuracy <b id="acc">100%</b></div><div class="pill">Best <b id="best">—</b></div>
+      <select id="tmode" style="width:auto"><option value="finance">Finance sentences</option><option value="common">Common words</option><option value="sw">Kiswahili</option></select>
+      <button class="btn ghost" id="tnew">New text</button>
+    </div>
+    <div class="typebox" id="tbox"></div>
+    <input id="tin" placeholder="Click here and start typing…" style="margin-top:10px" autocomplete="off" spellcheck="false">
+    <div class="warn">Technique from the videos: keep your fingers on <b>ASDF / JKL;</b> (bumps on F and J), don't look at the keyboard, and go for accuracy first. Speed comes after.</div>
+  </section>
+
+  <!-- PHONE & SECURITY -->
+  <section class="mod" id="m-phone">
+    <h2>PHONE & SECURITY</h2><p class="sub">Phone hacks, privacy settings and protecting your accounts.</p>
+    <div class="card" style="margin-bottom:14px">
+      <h3>🔐 Password strength check</h3><p>Checked only in this page. Your password is never sent or saved.</p>
+      <input type="password" id="pw" placeholder="Type a password to test" style="margin-top:10px">
+      <div class="meter"><i id="pwm"></i></div><p class="hint" id="pwt">—</p>
+      <div class="row"><button class="btn ghost" id="pwGen">Generate strong passphrase</button><span class="mono" id="pwOut" style="color:var(--gold)"></span></div>
+    </div>
+    <div class="grid" id="phlist"></div>
+  </section>
+
+  <!-- AI ARSENAL -->
+  <section class="mod" id="m-ai">
+    <h2>AI ARSENAL</h2><p class="sub">The AI tools and "websites you wish you knew earlier" from your saves, sorted by what they do.</p>
+    <div class="chips" id="aiChips"></div>
+    <div class="grid tight" id="ailist"></div>
+    <h2 style="margin-top:26px">PROMPT VAULT</h2><p class="sub">Prompts you can use in Claude or ChatGPT, written for your work and your side income.</p>
+    <div class="grid" id="prlist"></div>
+    <h2 style="margin-top:26px">TECH HUSTLE RADAR</h2><p class="sub">Money ideas that showed up in this collection.</p>
+    <div class="grid" id="hulist"></div>
+  </section>
+
+  <!-- NOTES -->
+  <section class="mod" id="m-notes">
+    <h2>MEMORY BANK</h2><p class="sub">Notes and tasks. Say <i>“note call TRA on Monday”</i> or add them here. Jarmoo can read them back.</p>
+    <form class="row" id="noteForm" style="margin-bottom:12px"><input id="noteIn" placeholder="New note or task…" style="flex:1"><button class="btn">Save</button></form>
+    <p class="hint" id="noteWhere"></p>
+    <div class="card" id="notes"><p class="hint">No notes yet.</p></div>
+  </section>
+</main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script type="text/plain" id="ps1"># =====================================================
+#  JARMOO PC TOOLKIT  -  for Moses
+#  Run as Administrator (Win + X -> Terminal (Admin))
+# =====================================================
+$ErrorActionPreference = 'SilentlyContinue'
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+  Write-Host "Restarting as Administrator..." -ForegroundColor Yellow
+  Start-Process powershell "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+  exit
+}
+function Wait-J { Write-Host ""; Read-Host "Done. Press Enter to return to the menu" | Out-Null }
+
+do {
+  Clear-Host
+  Write-Host "  JARMOO  PC TOOLKIT" -ForegroundColor Cyan
+  Write-Host "  ------------------------------------------" -ForegroundColor DarkCyan
+  Write-Host "   1  Clean junk (temp files, recycle bin, DNS cache)"
+  Write-Host "   2  Repair Windows system files (SFC + DISM)"
+  Write-Host "   3  Update ALL installed apps (winget)"
+  Write-Host "   4  Install many apps at once (winget)"
+  Write-Host "   5  Show my PC specs (CPU, RAM, GPU, disks)"
+  Write-Host "   6  Battery health report (saved to Desktop)"
+  Write-Host "   7  Show password of a SAVED Wi-Fi network"
+  Write-Host "   8  List startup apps (slow boot culprits)"
+  Write-Host "   9  Fix internet (reset network stack)"
+  Write-Host "  10  Check disk for errors (scan only)"
+  Write-Host "  11  Turn on High Performance power plan"
+  Write-Host "  12  Virus quick scan (Defender) + Malicious Software Removal Tool"
+  Write-Host "  13  Disk space overview"
+  Write-Host "   0  Exit"
+  Write-Host ""
+  $c = Read-Host "  Jarmoo, choose an option"
+  switch ($c) {
+    '1' {
+      Write-Host "Cleaning temp files..." -ForegroundColor Cyan
+      Remove-Item "$env:TEMP\*" -Recurse -Force
+      Remove-Item "C:\Windows\Temp\*" -Recurse -Force
+      Clear-RecycleBin -Force
+      ipconfig /flushdns | Out-Null
+      Write-Host "Junk cleaned. Tip: run 'cleanmgr' for a deeper Disk Cleanup." -ForegroundColor Green
+      Wait-J
+    }
+    '2' { sfc /scannow; DISM /Online /Cleanup-Image /RestoreHealth; Wait-J }
+    '3' { winget upgrade --all --accept-source-agreements --accept-package-agreements; Wait-J }
+    '4' {
+      Write-Host "Examples: Google.Chrome  VideoLAN.VLC  7zip.7zip  Notepad++.Notepad++  Zoom.Zoom  Mozilla.Firefox"
+      $ids = Read-Host "Type app IDs separated by spaces (search: winget search name)"
+      foreach ($id in $ids.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        winget install --id $id -e --accept-source-agreements --accept-package-agreements
+      }
+      Wait-J
+    }
+    '5' {
+      $cs = Get-CimInstance Win32_ComputerSystem
+      $os = Get-CimInstance Win32_OperatingSystem
+      Write-Host ("Model : " + $cs.Manufacturer + " " + $cs.Model)
+      Write-Host ("OS    : " + $os.Caption + " build " + $os.BuildNumber)
+      Write-Host ("CPU   : " + (Get-CimInstance Win32_Processor).Name)
+      Write-Host ("RAM   : " + [math]::Round($cs.TotalPhysicalMemory/1GB,1) + " GB")
+      Get-CimInstance Win32_PhysicalMemory | ForEach-Object { Write-Host ("  stick: " + [math]::Round($_.Capacity/1GB) + " GB @ " + $_.Speed + " MHz") }
+      Get-CimInstance Win32_VideoController | ForEach-Object { Write-Host ("GPU   : " + $_.Name) }
+      Get-PhysicalDisk | ForEach-Object { Write-Host ("Disk  : " + $_.FriendlyName + " | " + $_.MediaType + " | " + [math]::Round($_.Size/1GB) + " GB | health " + $_.HealthStatus) }
+      Wait-J
+    }
+    '6' {
+      $out = "$env:USERPROFILE\Desktop\battery-report.html"
+      powercfg /batteryreport /output $out
+      Write-Host "Saved: $out  (compare DESIGN CAPACITY vs FULL CHARGE CAPACITY)" -ForegroundColor Green
+      Start-Process $out
+      Wait-J
+    }
+    '7' {
+      netsh wlan show profiles
+      $n = Read-Host "Type the Wi-Fi name exactly as listed"
+      netsh wlan show profile name="$n" key=clear | Select-String "Key Content"
+      Wait-J
+    }
+    '8' { Get-CimInstance Win32_StartupCommand | Select-Object Name, Location, Command | Format-Table -AutoSize; Write-Host "Disable extras in Task Manager > Startup apps (Ctrl+Shift+Esc)."; Wait-J }
+    '9' { ipconfig /release; ipconfig /renew; ipconfig /flushdns; netsh winsock reset; netsh int ip reset; Write-Host "Restart the PC to finish." -ForegroundColor Yellow; Wait-J }
+    '10' { chkdsk C: /scan; Wait-J }
+    '11' { powercfg /setactive SCHEME_MIN; Write-Host "High Performance plan active (uses more battery)." -ForegroundColor Green; Wait-J }
+    '12' { Start-MpScan -ScanType QuickScan; Write-Host "Quick scan finished. Opening MRT..."; Start-Process mrt; Wait-J }
+    '13' { Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='Used(GB)';e={[math]::Round($_.Used/1GB,1)}}, @{n='Free(GB)';e={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize; Wait-J }
+  }
+} while ($c -ne '0')
+</script>
+
+<script>
+/* ================= DATA ================= */
+const EXCEL=[
+ {t:"Dynamic serial numbers",k:"numbering sequence auto number filter",f:"=SEQUENCE(COUNTA(B2:B1000))",d:"Numbers grow automatically as you add rows. If you filter the list, use =SUBTOTAL(3,$B$2:B2) in A2 and fill down so the numbering stays 1,2,3 on visible rows."},
+ {t:"Exact age from date of birth",k:"age dob datedif years months",f:'=DATEDIF(B2,TODAY(),"Y")&" yrs "&DATEDIF(B2,TODAY(),"YM")&" months"',d:"B2 = date of birth. Good for staff records and HR files."},
+ {t:"Day / month name from a date",k:"day month name text weekday",f:'=TEXT(A2,"dddd")   →  Monday\n=TEXT(A2,"mmmm")   →  November',d:'Use "ddd" or "mmm" for short names.'},
+ {t:"Total working hours (incl. night shifts)",k:"hours time attendance overtime timesheet",f:"=MOD(C2-B2,1)*24",d:"B2 = time in, C2 = time out. Works past midnight. To total hours, use SUM with custom format [h]:mm so it doesn't reset at 24."},
+ {t:"In-cell progress bar",k:"progress bar rept visual percent",f:'=REPT("█",ROUND(B2*10,0))&REPT("░",10-ROUND(B2*10,0))&" "&TEXT(B2,"0%")',d:"B2 = % complete (0–100%). Or use Home → Conditional Formatting → Data Bars."},
+ {t:"Sum comma-separated values in one cell",k:"comma separated sum textsplit",f:'=SUM(--TEXTSPLIT(A2,","))',d:'A2 = "200,450,1000" → 1650. Needs Excel 365 / 2021+.'},
+ {t:"Better than SUM: ignore errors & hidden rows",k:"sum aggregate subtotal errors filtered",f:"=AGGREGATE(9,6,B2:B500)     ← ignores #N/A, #DIV/0!\n=SUBTOTAL(109,B2:B500)      ← only visible (filtered) rows",d:"Quick AutoSum: select the cell under the numbers and press Alt + =."},
+ {t:"Count with conditions",k:"countif countifs count conditions",f:'=COUNTIFS(C:C,"Paid",D:D,">=100000")',d:"Counts rows where C = Paid AND D ≥ 100,000. For one condition use COUNTIF."},
+ {t:"Sum with conditions",k:"sumif sumifs conditions",f:'=SUMIFS(D:D,B:B,"Fertilizer",A:A,">="&DATE(2026,10,1),A:A,"<="&EOMONTH(DATE(2026,10,1),0))',d:"Sum of D for Fertilizer in October 2026."},
+ {t:"XLOOKUP (replaces VLOOKUP)",k:"lookup xlookup vlookup find match",f:'=XLOOKUP(E2,A:A,C:C,"Not found")',d:"Looks up E2 in column A and returns column C. Can look left, and lets you set your own not-found message."},
+ {t:"Clean messy data in one go",k:"clean trim proper data cleaning spaces",f:"=PROPER(TRIM(CLEAN(A2)))",d:"Removes extra spaces and hidden characters and fixes capitalisation. Remove duplicates: =UNIQUE(A2:A500)."},
+ {t:"Fill all blanks at once",k:"replace blanks empty cells zero go to special",f:"Select range → F5 → Special → Blanks → type 0 → Ctrl + Enter",d:"Fills every empty cell in one action. To copy the value from above instead, type = then ↑ and press Ctrl+Enter."},
+ {t:"PDF table → Excel (no retyping)",k:"pdf convert import table get data",f:"Data → Get Data → From File → From PDF → pick the table → Load",d:"Works for bank statements and supplier invoices. Clean it in Power Query before loading if needed."},
+ {t:"Excel CAMERA (live snapshot of a range)",k:"camera picture linked snapshot dashboard",f:"Copy range → Home → Paste ▾ → Linked Picture",d:"Creates a live image that updates when the data changes. Good for dashboards and summaries. Or add the 'Camera' button to the Quick Access Toolbar."},
+ {t:"Auto-fit every column in seconds",k:"autofit column width adjust",f:"Ctrl + A  →  Alt, H, O, I",d:"Or double-click the border between column letters."},
+ {t:"Shrink text to fit a cell",k:"shrink fit text cell alignment",f:"Ctrl + 1 → Alignment → ☑ Shrink to fit",d:"Long text shrinks to fit the cell instead of spilling over."},
+ {t:"Automatic borders/underline as you type",k:"underline border automatic conditional formatting",f:'Select A2:F500 → Conditional Formatting → New Rule → Use a formula:\n=$A2<>""   → Format → Border → bottom line',d:"A border appears automatically when a row gets data."},
+ {t:"Flash Fill (Excel reads your pattern)",k:"flash fill split names extract pattern",f:"Type 1–2 examples → Ctrl + E",d:"Split full names, pull out phone numbers or join columns without formulas."},
+ {t:"Attendance tracker",k:"attendance tracker present absent register",f:'=COUNTIF(C2:AG2,"P")      ← days present\n=COUNTIF(C2:AG2,"A")      ← days absent\n=COUNTIF(C2:AG2,"P")/COUNTA(C2:AG2)  ← attendance %',d:"Add Data Validation list (P, A, L) and colour codes with Conditional Formatting."},
+ {t:"Instant date & time stamps",k:"date time stamp now today clock",f:"Ctrl + ;          → today's date (fixed)\nCtrl + Shift + ;  → current time (fixed)\n=NOW()            → live clock (press F9 to refresh)",d:'Custom format for the digital clock: hh:mm:ss AM/PM'},
+ {t:"Record a macro (automate repeats)",k:"macro record automate vba",f:"View → Macros → Record Macro → do the task → Stop Recording",d:"Save the file as .xlsm. After that, one click repeats the whole task."},
+ {t:"Filter on/off",k:"filter enable disable",f:"Ctrl + Shift + L",d:"Turns filter arrows on or off for the current table."},
+ {t:"VAT 18% (Tanzania)",k:"vat tax tra 18 inclusive exclusive",f:"Add VAT:        =A2*1.18\nVAT amount:     =A2*18%\nFrom inclusive: =A2/1.18   (net)\nVAT in incl.:   =A2-A2/1.18",d:"A2 = amount. Change 18% if the rate changes."},
+ {t:"Loan repayment (PMT)",k:"loan pmt repayment installment interest finance",f:"=PMT(B1/12,B2*12,-B3)",d:"B1 = annual rate, B2 = years, B3 = loan amount → monthly instalment."},
+ {t:"NPV & IRR for projects",k:"npv irr investment project appraisal finance",f:"=NPV(B1,C2:C11)+C1\n=IRR(C1:C11)",d:"C1 = initial outflow (negative), C2:C11 = yearly cash flows, B1 = discount rate."},
+ {t:"Month-end dates",k:"eomonth month end due date accrual",f:"=EOMONTH(A2,0)    ← end of this month\n=EOMONTH(A2,1)    ← end of next month",d:"Use for accruals, due dates and closing schedules."},
+ {t:"Show all formulas (audit)",k:"show formulas audit check",f:"Ctrl + `   (the key above Tab)",d:"Shows formulas instead of values. Useful for reviewing a workbook."}
+];
+
+const PC=[
+ {c:"Speed",t:"Clean temp junk",cmd:"del /q /f /s %TEMP%\\*\ncleanmgr",d:"Removes temporary files that slow the PC down, then opens Disk Cleanup."},
+ {c:"Speed",t:"Disable heavy startup apps",cmd:"Ctrl + Shift + Esc  →  Startup apps  →  Disable",d:"This is the main fix for a PC that boots slowly."},
+ {c:"Speed",t:"High Performance power plan",cmd:"powercfg /setactive SCHEME_MIN",d:"Gives the CPU full power (best when plugged in). Revert: powercfg /setactive SCHEME_BALANCED"},
+ {c:"Speed",t:"Max screen refresh rate",cmd:"Settings → System → Display → Advanced display → Choose refresh rate → highest",d:"Smoother screen if your monitor supports 75/120/144 Hz."},
+ {c:"Speed",t:"Visual effects off (old laptops)",cmd:"SystemPropertiesPerformance",d:"Choose 'Adjust for best performance' on slow machines."},
+ {c:"Repair",t:"Scan & fix corrupt system files",cmd:"sfc /scannow\nDISM /Online /Cleanup-Image /RestoreHealth",d:"Fixes most freezes, crashes and odd Windows errors. Run SFC again after DISM."},
+ {c:"Repair",t:"Reset graphics driver (screen freeze)",cmd:"Win + Ctrl + Shift + B",d:"The screen blinks and the driver restarts. Your open work stays."},
+ {c:"Repair",t:"Check disk for errors",cmd:"chkdsk C: /scan",d:"Online scan. Use chkdsk C: /f to repair (needs a restart)."},
+ {c:"Repair",t:"Blue screen / crashed Windows",cmd:"Hold Shift + click Restart → Troubleshoot → Advanced → Startup Repair\n(or System Restore / Uninstall Updates)",d:"Recovery options when Windows won't start normally."},
+ {c:"Repair",t:"Repair a USB flash drive",cmd:"chkdsk E: /f\n(replace E: with your USB letter)",d:"Fixes a USB drive that asks to be formatted or won't open. Back up first if you can."},
+ {c:"Repair",t:"Fix internet / Wi-Fi",cmd:"ipconfig /flushdns\nnetsh winsock reset\nnetsh int ip reset",d:"Restart afterwards. Fixes 'connected, no internet'."},
+ {c:"Update",t:"Update ALL apps in one command",cmd:"winget upgrade --all",d:"Updates Chrome, VLC, Zoom, 7-Zip and more at once. Built into Windows 10/11."},
+ {c:"Update",t:"Install many apps at once",cmd:"winget install -e --id Google.Chrome\nwinget install -e --id VideoLAN.VLC\nwinget install -e --id 7zip.7zip",d:"Or tick boxes at ninite.com and install them all in one go. Find IDs with: winget search name"},
+ {c:"Info",t:"Full PC specs",cmd:"systeminfo\nmsinfo32\ndxdiag",d:"CPU, RAM, Windows version and GPU. Use this before upgrading or selling a PC."},
+ {c:"Info",t:"How much RAM can I add?",cmd:"wmic memphysical get maxcapacity, memorydevices\nwmic memorychip get capacity, speed",d:"MaxCapacity is in KB (16777216 = 16 GB). Also shows how many slots there are."},
+ {c:"Info",t:"Battery health report",cmd:"powercfg /batteryreport",d:"Creates battery-report.html. Compare Design Capacity with Full Charge Capacity."},
+ {c:"Info",t:"Is my Windows activated?",cmd:"slmgr /xpr",d:"Shows activation status. Only use a genuine licence. Skip any 'permanent activation' scripts: they often carry malware."},
+ {c:"Info",t:"See a SAVED Wi-Fi password",cmd:'netsh wlan show profiles\nnetsh wlan show profile name="WIFI-NAME" key=clear',d:"Look for 'Key Content'. Works only for networks this PC has already joined."},
+ {c:"Security",t:"Virus scan + malware removal",cmd:"Start-MpScan -ScanType QuickScan   (PowerShell)\nmrt",d:"Windows Defender scan, then Microsoft's Malicious Software Removal Tool (MRT)."},
+ {c:"Security",t:"Lock your PC instantly",cmd:"Win + L",d:"Use it every time you step away from your desk."},
+ {c:"Security",t:"Password on your account",cmd:"Settings → Accounts → Sign-in options → Password / PIN",d:"Set Windows Hello PIN too. It's faster and more secure."},
+ {c:"Tools",t:"Record screen (built-in)",cmd:"Win + Alt + R       (Game Bar record)\nWin + Shift + S     (screenshot / Snipping)\nWin + Shift + R     (Snipping Tool video, Win 11)",d:"For quality recordings use OBS Studio (free)."},
+ {c:"Tools",t:"Clipboard history",cmd:"Win + V",d:"Paste anything you copied earlier. Turn it on the first time."},
+ {c:"Tools",t:"Quick shutdown / timer",cmd:"shutdown /s /t 0          (now)\nshutdown /s /t 3600       (in 1 hour)\nshutdown /a               (cancel)",d:"Or press Alt + F4 on the desktop."},
+ {c:"Tools",t:"Control PC from your phone",cmd:"remotedesktop.google.com/access",d:"Chrome Remote Desktop is free. Install it on the PC, then open it from your phone anywhere."},
+ {c:"Tools",t:"Phone as a second screen",cmd:"spacedesk.net  (driver on PC + app on phone)",d:"Extends your laptop screen to an Android phone or tablet over Wi-Fi."},
+ {c:"Tools",t:"Laptop to TV / projector wirelessly",cmd:"Win + K   (Cast)\nWin + P   (Project mode)",d:"Works with Miracast smart TVs."},
+ {c:"Tools",t:"Fast file transfer phone ↔ PC",cmd:"localsend.org",d:"Free, no cables and no internet needed. Both devices just need the same Wi-Fi."},
+ {c:"Tools",t:"Colour-code folders",cmd:"Right-click folder → Properties → Customize → Change Icon",d:"Or use the free Folder Colorizer tool."},
+ {c:"Tools",t:"God Mode (every setting in one folder)",cmd:"New folder named:\nGodMode.{ED7BA470-8E54-465E-825C-99712043E01C}",d:"A hidden Windows control panel with 200+ settings."}
+];
+
+const KEYS={
+ Windows:[["Show desktop","Win + D"],["File Explorer","Win + E"],["Lock PC","Win + L"],["Clipboard history","Win + V"],["Screenshot snip","Win + Shift + S"],["Emoji & symbols","Win + ."],["Quick link menu","Win + X"],["Settings","Win + I"],["Task Manager","Ctrl + Shift + Esc"],["Switch apps","Alt + Tab"],["New virtual desktop","Win + Ctrl + D"],["Switch desktops","Win + Ctrl + ← / →"],["Record screen","Win + Alt + R"],["Reset graphics driver","Win + Ctrl + Shift + B"],["Cast to screen","Win + K"],["Snap window","Win + ← / →"],["New folder","Ctrl + Shift + N"],["Rename file","F2"],["Desktop icon size","Ctrl + Mouse wheel"],["Close app / shutdown","Alt + F4"],["© symbol","Alt + 0169"],["® symbol","Alt + 0174"],["™ symbol","Alt + 0153"]],
+ Excel:[["Today's date","Ctrl + ;"],["Current time","Ctrl + Shift + ;"],["AutoSum","Alt + ="],["Flash Fill","Ctrl + E"],["Make a Table","Ctrl + T"],["Filter on/off","Ctrl + Shift + L"],["Absolute reference $","F4"],["Format cells","Ctrl + 1"],["Select column","Ctrl + Space"],["Select row","Shift + Space"],["Select to edge","Ctrl + Shift + Arrow"],["Fill down","Ctrl + D"],["New line in cell","Alt + Enter"],["Edit cell","F2"],["Show formulas","Ctrl + `"],["Next / prev sheet","Ctrl + PgDn / PgUp"],["Currency format","Ctrl + Shift + $"],["Percent format","Ctrl + Shift + %"],["Insert row/col","Ctrl + Shift + +"],["Fill selection","Ctrl + Enter"]],
+ Word:[["Change case UPPER/lower","Shift + F3"],["Bigger font","Ctrl + Shift + >"],["Center","Ctrl + E"],["Justify","Ctrl + J"],["Page break","Ctrl + Enter"],["Insert date","Alt + Shift + D"],["Hyperlink","Ctrl + K"],["Find & replace","Ctrl + H"],["Copy formatting","Ctrl + Shift + C"],["Paste formatting","Ctrl + Shift + V"],["Spelling check","F7"],["Select all","Ctrl + A"]],
+ PowerPoint:[["Duplicate object/slide","Ctrl + D"],["Group","Ctrl + G"],["Ungroup","Ctrl + Shift + G"],["New slide","Ctrl + M"],["Start slideshow","F5"],["From current slide","Shift + F5"],["Black screen","B"],["White screen","W"],["Align / nudge","Arrow keys (Ctrl for fine)"]],
+ "Tally Prime":[["Contra voucher","F4"],["Payment voucher","F5"],["Receipt voucher","F6"],["Journal voucher","F7"],["Sales voucher","F8"],["Purchase voucher","F9"],["Credit note","Ctrl + F8"],["Debit note","Ctrl + F9"],["Change date","F2"],["Change period","Alt + F2"],["Go To","Alt + G"],["Accept / save","Ctrl + A"],["Create master on the fly","Alt + C"]],
+ Chrome:[["Reopen closed tab","Ctrl + Shift + T"],["Next tab","Ctrl + Tab"],["Jump to tab 1-8","Ctrl + 1…8"],["Address bar","Ctrl + L"],["Incognito","Ctrl + Shift + N"],["History","Ctrl + H"],["Downloads","Ctrl + J"],["Clear browsing data","Ctrl + Shift + Delete"],["Find on page","Ctrl + F"]]
+};
+
+const PHONE=[
+ {t:"Stop Google listening to you",s:"myactivity.google.com → Web & App Activity → untick 'Include voice and audio activity'. Phone: Settings → Apps → Google → Permissions → Microphone → 'Ask every time'.",l:"https://myactivity.google.com"},
+ {t:"Remove ads from your whole phone",s:"Settings → Connections → More → Private DNS → Hostname: dns.adguard-dns.com. This blocks most ads in apps and browsers.",l:""},
+ {t:"Find a lost or stolen phone",s:"Go to google.com/android/find (or Samsung: smartthingsfind.samsung.com). You can ring it, lock it or erase it. Set this up NOW, before the phone goes missing.",l:"https://www.google.com/android/find"},
+ {t:"Before selling or giving away a phone",s:"1) Back up. 2) Remove your Google/Samsung account (avoids FRP lock). 3) Remove SIM & SD. 4) Settings → Reset → Factory data reset. 5) Unlink it from WhatsApp, banking & M-Pesa apps.",l:""},
+ {t:"Secret codes (dial them)",s:"*#06# → IMEI number (keep it written down)\n*#*#4636#*#* → phone, battery & Wi-Fi info (many Androids)\n*#0*# → Samsung hardware test\n*#0228# → Samsung battery status",l:""},
+ {t:"Update all phone apps at once",s:"Play Store → profile icon → Manage apps & device → Update all. Turn on auto-update over Wi-Fi.",l:""},
+ {t:"Do Not Disturb, the smart way",s:"Settings → Notifications → Do Not Disturb → allow only Favourites & repeat callers. For deep work, pair it with Jarmoo's Focus timer.",l:""},
+ {t:"Make your phone faster",s:"Developer options (tap Build number 7×) → set Window/Transition/Animator scale to 0.5x. Uninstall unused apps and clear storage.",l:""},
+ {t:"Free up Gmail / Google storage",s:"In Gmail search: has:attachment larger:10M → delete. Then: one.google.com/storage → 'Clean up space'.",l:"https://one.google.com/storage"},
+ {t:"Has your email been leaked?",s:"Check your emails on Have I Been Pwned. If one shows up, change that password and turn on 2-step verification.",l:"https://haveibeenpwned.com"},
+ {t:"Remove your personal info from Google",s:"Google app → profile → 'Results about you'. Request removal of your phone number, address and email from search results.",l:"https://myactivity.google.com/results-about-you"},
+ {t:"Clean up your digital footprint",s:"Use one password manager. Delete accounts you no longer use (the '83 websites' video). Review app permissions every month.",l:""},
+ {t:"Turn on 2-step verification",s:"Google: myaccount.google.com/security. Do the same for WhatsApp (Settings → Account → Two-step), Instagram and banking apps.",l:"https://myaccount.google.com/security"},
+ {t:"Chrome: turn on Memory Saver",s:"Chrome → Settings → Performance → Memory Saver ON. Inactive tabs stop using RAM.",l:""},
+ {t:"Google Maps hidden features",s:"Long-press any spot → share exact location. Also: Offline maps (download your region before trips) and Timeline (where you've been).",l:""}
+];
+
+const AI=[
+ {c:"Chat & thinking",n:"Claude",u:"https://claude.ai",d:"Long documents, analysis, writing, coding. Your main AI."},
+ {c:"Chat & thinking",n:"ChatGPT",u:"https://chatgpt.com",d:"General assistant, quick ideas, image generation."},
+ {c:"Chat & thinking",n:"Gemini",u:"https://gemini.google.com",d:"Google's AI. Works with Gmail and Drive."},
+ {c:"Chat & thinking",n:"Perplexity",u:"https://www.perplexity.ai",d:"Search answers with sources. Good for research."},
+ {c:"Chat & thinking",n:"NotebookLM",u:"https://notebooklm.google.com",d:"Upload PDFs and get summaries, Q&A and audio overviews."},
+ {c:"Images & design",n:"Microsoft Copilot",u:"https://copilot.microsoft.com",d:"Free AI image generation (the Copilot video in your saves)."},
+ {c:"Images & design",n:"Canva",u:"https://www.canva.com",d:"Posters, social posts and Magic Design."},
+ {c:"Images & design",n:"Photopea",u:"https://www.photopea.com",d:"Free Photoshop in the browser: remove backgrounds and clean up images."},
+ {c:"Images & design",n:"remove.bg",u:"https://www.remove.bg",d:"One-click background removal (passport photos, products)."},
+ {c:"Images & design",n:"Napkin",u:"https://www.napkin.ai",d:"Turns text into infographics and diagrams."},
+ {c:"Slides & docs",n:"Gamma",u:"https://gamma.app",d:"Full slide decks from one prompt."},
+ {c:"Slides & docs",n:"iLovePDF",u:"https://www.ilovepdf.com",d:"Merge, split, compress, PDF→Excel/Word."},
+ {c:"Slides & docs",n:"TinyWow",u:"https://tinywow.com",d:"Hundreds of free PDF, image and video tools."},
+ {c:"Video & voice",n:"CapCut",u:"https://www.capcut.com",d:"Edit Reels with auto-captions and AI effects."},
+ {c:"Video & voice",n:"DupDub",u:"https://www.dupdub.com",d:"AI voiceovers and talking avatars (the 'blow your mind' video)."},
+ {c:"Video & voice",n:"ElevenLabs",u:"https://elevenlabs.io",d:"Very realistic AI voices and dubbing."},
+ {c:"Video & voice",n:"HeyGen",u:"https://www.heygen.com",d:"AI avatar videos for faceless content."},
+ {c:"Websites",n:"Durable",u:"https://durable.co",d:"Builds a business website in about 1 minute."},
+ {c:"Websites",n:"Framer",u:"https://www.framer.com",d:"Good-looking websites from AI prompts."},
+ {c:"Learn & practice",n:"Monkeytype",u:"https://monkeytype.com",d:"Typing speed practice."},
+ {c:"Learn & practice",n:"keybr",u:"https://www.keybr.com",d:"Learn touch typing from scratch."},
+ {c:"Learn & practice",n:"Excel Jet",u:"https://exceljet.net",d:"Clear explanations of every Excel formula."},
+ {c:"PC & phone",n:"Ninite",u:"https://ninite.com",d:"Install many PC apps in one click."},
+ {c:"PC & phone",n:"LocalSend",u:"https://localsend.org",d:"Share files between phone and PC over Wi-Fi."},
+ {c:"PC & phone",n:"Chrome Remote Desktop",u:"https://remotedesktop.google.com",d:"Control your PC from your phone."},
+ {c:"PC & phone",n:"spacedesk",u:"https://www.spacedesk.net",d:"Use your phone as a second monitor."}
+];
+
+const PROMPTS=[
+ {t:"Excel formula builder",p:"You are an Excel expert. My data: [describe columns, e.g. A=Date, B=Product, C=Qty, D=Amount TZS]. I need a formula that [goal]. Give the formula, explain each part in simple words, and give one alternative for older Excel versions."},
+ {t:"Finance report narrative",p:"Act as a senior finance officer at an agribusiness in Tanzania. Using these figures: [paste], write a 1-page management commentary: key variances vs budget, causes, risks, and 3 recommended actions. Keep it concise and in TZS."},
+ {t:"Faceless content business plan",p:"Build me a 30-day plan for a faceless Instagram page called 'Opportunity Room' about online income and tech tips for East Africans. Include: content pillars, 30 post ideas with hooks, tools to create each post with AI, and how to monetise by day 90."},
+ {t:"LinkedIn post from my wins",p:"Write a LinkedIn post (150–200 words) from this achievement: [describe]. Tone: confident, humble and specific. Start with a strong hook, include one lesson others can use, and end with a question. No hashtags spam, max 3."},
+ {t:"Tailor my CV to a job",p:"Here is a job description: [paste]. Here is my CV: [paste]. Rewrite my profile summary and top 6 bullet points to match the role using the job's keywords, with measurable results. Do not invent facts."},
+ {t:"Learn any skill in 7 days",p:"Teach me [skill, e.g. Power Query] in 7 days, 30 minutes a day. For each day: one concept, one practical exercise using finance data, and a 3-question check. Start with Day 1 now and wait for me before Day 2."}
+];
+
+const HUSTLE=[
+ {t:"Wi-Fi voucher business",d:"Set up a hotspot router with a voucher system and sell time-based access (1h / day / week) in a busy area. Your saves included a Wi-Fi voucher business starter post."},
+ {t:"Excel & finance freelancing",d:"Offer dashboards, bookkeeping clean-ups and payroll templates on Upwork or Fiverr, or to local SMEs. Your CPA-T is a strong selling point."},
+ {t:"AI content services",d:"Make Reels, voiceovers and posters for local businesses with CapCut, Canva and DupDub. Charge a monthly package."},
+ {t:"Electronics resale",d:"Smart glasses, power banks and routers from Kariakoo show up a lot in your saves. Sell with good product videos on Instagram and WhatsApp."},
+ {t:"PC tune-up service",d:"Use the Jarmoo Toolkit to offer a 'clean, update and speed up your laptop' service to offices nearby."}
+];
+
+const TYPE_TEXT={
+ finance:["The trial balance must agree before the financial statements are prepared for audit.","Accrued expenses are recognised in the period in which the related service was received.","Cash flow from operating activities shows how well the business turns profit into cash.","Every journal entry needs a clear narration, a supporting document and an approval.","Internal controls reduce the risk of fraud and errors in the accounting process.","Value added tax is charged at eighteen percent on most taxable supplies in Tanzania."],
+ common:["the quick brown fox jumps over the lazy dog while the team works on the next big plan","practice every day and your hands will learn the keyboard faster than you think","small steps taken each morning build the strength you need for great results"],
+ sw:["Mafanikio hayaji kwa bahati bali kwa juhudi na nidhamu ya kila siku.","Kila siku ni nafasi mpya ya kujifunza jambo jipya na kukua zaidi.","Biashara nzuri inahitaji mipango, uaminifu na kumbukumbu sahihi za fedha."]
+};
+
+/* ================= UTIL ================= */
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("on");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("on"),1800)}
+async function copyText(t){try{await navigator.clipboard.writeText(t);toast("Copied ✔")}catch(e){toast("Select & copy manually")}}
+document.addEventListener("click",e=>{const b=e.target.closest("[data-copy]");if(b){copyText(b.closest(".code").querySelector("pre,span.c")?.textContent ?? b.dataset.copy)}});
+const codeBlock=t=>`<div class="code"><button class="copy" data-copy>Copy</button><span class="c">${esc(t)}</span></div>`;
+
+/* ================= NAV ================= */
+const MODS=[["home","◉","Jarmoo Console"],["forex","📈","Forex Command"],["vault","🗂","Life Vault"],["voice","🎙","Voice Studio"],["excel","▦","Excel Lab"],["pc","⚙","PC Doctor"],["keys","⌨","Shortcuts"],["type","✎","Typing Dojo"],["phone","📱","Phone & Security"],["ai","✦","AI Arsenal"],["notes","☰","Memory Bank"]];
+$("#nav").innerHTML=MODS.map(([id,ic,n])=>`<button data-m="${id}"><span class="ic">${ic}</span>${n}</button>`).join("");
+function openMod(id){
+  if(!MODS.find(m=>m[0]===id))return false;
+  document.querySelectorAll("section.mod").forEach(s=>s.classList.toggle("on",s.id==="m-"+id));
+  document.querySelectorAll("#nav button").forEach(b=>b.classList.toggle("on",b.dataset.m===id));
+  if(location.hash!=="#"+id)history.replaceState(null,"","#"+id);
+  window.scrollTo({top:0});
+  return true;
+}
+$("#nav").addEventListener("click",e=>{const b=e.target.closest("button");if(b)openMod(b.dataset.m)});
+window.addEventListener("hashchange",()=>openMod(location.hash.slice(1)||"home"));
+
+/* ================= CLOCK & FOCUS ================= */
+function tick(){
+  const now=new Date();
+  const o={timeZone:"Africa/Nairobi"};
+  $("#clock").textContent=now.toLocaleTimeString("en-GB",{...o,hour12:false});
+  $("#today").textContent=now.toLocaleDateString("en-GB",{...o,weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  const h=+now.toLocaleString("en-GB",{...o,hour:"2-digit",hour12:false});
+  $("#hello").textContent=(h<12?"Good morning":h<17?"Good afternoon":"Good evening")+", Moses";
+}
+tick();setInterval(tick,1000);
+let focusLeft=25*60,focusRun=null;
+const fmtF=s=>String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0");
+function setFocus(min){focusLeft=min*60;$("#focusT").textContent=fmtF(focusLeft)}
+function startFocus(min){
+  if(min)setFocus(min);
+  clearInterval(focusRun);
+  focusRun=setInterval(()=>{focusLeft--;$("#focusT").textContent=fmtF(Math.max(focusLeft,0));if(focusLeft<=0){clearInterval(focusRun);focusRun=null;$("#focusBtn").textContent="Start";say("Focus session complete. Take a five minute break, Moses.");}},1000);
+  $("#focusBtn").textContent="Pause";
+}
+$("#focusBtn").onclick=()=>{if(focusRun){clearInterval(focusRun);focusRun=null;$("#focusBtn").textContent="Start"}else startFocus()};
+$("#focusReset").onclick=()=>{clearInterval(focusRun);focusRun=null;$("#focusBtn").textContent="Start";setFocus(25)};
+
+/* ================= EXCEL ================= */
+function renderExcel(q=""){
+  q=q.toLowerCase().trim();
+  const list=EXCEL.filter(x=>!q||(x.t+" "+x.k+" "+x.d).toLowerCase().includes(q));
+  $("#xlist").innerHTML=list.map(x=>`<div class="card"><h3>${esc(x.t)}</h3><p>${esc(x.d)}</p>${codeBlock(x.f)}</div>`).join("")||`<p class="hint">Nothing matched. Try the Formula Builder above.</p>`;
+}
+$("#xq").oninput=e=>renderExcel(e.target.value);
+
+/* ================= PC ================= */
+let pcCat="All";
+function renderPC(){
+  const cats=["All",...new Set(PC.map(p=>p.c))];
+  $("#pcChips").innerHTML=cats.map(c=>`<button class="chip ${c===pcCat?"on":""}" data-c="${c}">${c}</button>`).join("");
+  $("#pclist").innerHTML=PC.filter(p=>pcCat==="All"||p.c===pcCat).map(p=>`<div class="card"><span class="tag">${p.c}</span><h3 style="margin-top:6px">${esc(p.t)}</h3><p>${esc(p.d)}</p>${codeBlock(p.cmd)}</div>`).join("");
+}
+$("#pcChips").onclick=e=>{const b=e.target.closest("button");if(b){pcCat=b.dataset.c;renderPC()}};
+const PS1=$("#ps1").textContent.replace(/^\n/,"");
+$("#cpPs").onclick=()=>copyText(PS1);
+
+/* ================= KEYS ================= */
+let kCat="Windows",kCur=null,kSeen=0;
+function renderKeys(){
+  $("#kChips").innerHTML=Object.keys(KEYS).map(c=>`<button class="chip ${c===kCat?"on":""}" data-c="${c}">${c}</button>`).join("");
+  $("#klist").innerHTML=`<h3>${kCat}</h3>`+KEYS[kCat].map(([a,k])=>`<div class="sc"><span>${esc(a)}</span>${k.split(" + ").map(x=>`<kbd>${esc(x)}</kbd>`).join(" + ")}</div>`).join("");
+}
+$("#kChips").onclick=e=>{const b=e.target.closest("button");if(b){kCat=b.dataset.c;kSeen=0;renderKeys();$("#kq").textContent="Press “Next” to start";$("#ka").innerHTML="";$("#kScore").textContent=""}};
+$("#kNext").onclick=()=>{const L=KEYS[kCat];kCur=L[Math.floor(Math.random()*L.length)];kSeen++;$("#kq").textContent=kCur[0];$("#ka").innerHTML="";$("#kScore").textContent=`${kSeen} asked in ${kCat}`};
+$("#kReveal").onclick=()=>{if(kCur)$("#ka").innerHTML=kCur[1].split(" + ").map(x=>`<kbd>${esc(x)}</kbd>`).join(" + ")};
+if(window.innerWidth<860)$("#kwrap").style.gridTemplateColumns="1fr";
+
+/* ================= TYPING ================= */
+let tTarget="",tStart=0;
+function bestGet(){try{return localStorage.getItem("jv_best")}catch(e){return null}}
+function bestSet(v){try{localStorage.setItem("jv_best",v)}catch(e){}}
+function newType(){
+  const pool=TYPE_TEXT[$("#tmode").value];
+  const a=[...pool].sort(()=>Math.random()-.5);
+  tTarget=a.slice(0,$("#tmode").value==="common"?1:2).join(" ");
+  tStart=0;$("#tin").value="";$("#wpm").textContent="0";$("#acc").textContent="100%";drawType("");
+  $("#best").textContent=bestGet()?bestGet()+" wpm":"—";
+}
+function drawType(v){
+  let h="";
+  for(let i=0;i<tTarget.length;i++){
+    const ch=esc(tTarget[i]);
+    if(i<v.length)h+=`<span class="${v[i]===tTarget[i]?"ok":"bad"}">${ch}</span>`;
+    else h+=`<span class="rest ${i===v.length?"cur":""}">${ch}</span>`;
+  }
+  $("#tbox").innerHTML=h;
+}
+$("#tin").oninput=e=>{
+  const v=e.target.value;if(!tStart)tStart=Date.now();
+  drawType(v);
+  const mins=(Date.now()-tStart)/60000;let ok=0;for(let i=0;i<v.length;i++)if(v[i]===tTarget[i])ok++;
+  const wpm=mins>0?Math.round(ok/5/mins):0;
+  $("#wpm").textContent=wpm;$("#acc").textContent=v.length?Math.round(ok/v.length*100)+"%":"100%";
+  if(v.length>=tTarget.length){
+    const b=+bestGet()||0;if(wpm>b){bestSet(wpm);toast("New best: "+wpm+" WPM 🏆")}else toast("Done: "+wpm+" WPM");
+    e.target.disabled=true;setTimeout(()=>{e.target.disabled=false;newType();e.target.focus()},1600);
+  }
+};
+$("#tnew").onclick=newType;$("#tmode").onchange=newType;
+
+/* ================= PHONE ================= */
+$("#phlist").innerHTML=PHONE.map(p=>`<div class="card"><h3>${esc(p.t)}</h3><p style="white-space:pre-line">${esc(p.s)}</p>${p.l?`<p style="margin-top:8px"><a href="${p.l}" target="_blank" rel="noopener">Open →</a></p>`:""}</div>`).join("");
+$("#pw").oninput=e=>{
+  const p=e.target.value;let pool=0;
+  if(/[a-z]/.test(p))pool+=26;if(/[A-Z]/.test(p))pool+=26;if(/\d/.test(p))pool+=10;if(/[^\w]/.test(p))pool+=32;
+  let bits=p.length*Math.log2(pool||1);
+  if(/(.)\1{2,}/.test(p)||/^(password|123456|qwerty|admin)/i.test(p))bits*=.5;
+  const pct=Math.min(100,bits/90*100);
+  const [lab,col]=bits<35?["Weak, can be cracked quickly","var(--bad)"]:bits<60?["Okay, make it longer","var(--gold)"]:bits<80?["Strong","var(--ok)"]:["Very strong 💪","var(--cy)"];
+  $("#pwm").style.width=pct+"%";$("#pwm").style.background=col;
+  $("#pwt").textContent=p?`${lab} · ~${Math.round(bits)} bits`:"—";
+};
+$("#pwGen").onclick=()=>{
+  const w=["simba","mango","river","kilimo","safari","tembo","rocket","jasmine","nyota","ledger","harvest","coral","pepper","baobab","zebra","cloud"];
+  const r=new Uint32Array(5);crypto.getRandomValues(r);
+  const s=[0,1,2,3].map(i=>w[r[i]%w.length]).join("-")+"-"+(r[4]%90+10)+"!";
+  $("#pwOut").textContent=s;copyText(s);
+};
+
+/* ================= AI ================= */
+let aiCat="All";
+function renderAI(){
+  const cats=["All",...new Set(AI.map(a=>a.c))];
+  $("#aiChips").innerHTML=cats.map(c=>`<button class="chip ${c===aiCat?"on":""}" data-c="${c}">${c}</button>`).join("");
+  $("#ailist").innerHTML=AI.filter(a=>aiCat==="All"||a.c===aiCat).map(a=>`<a class="card" href="${a.u}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit;display:block"><span class="tag">${a.c}</span><h3 style="margin-top:6px">${esc(a.n)} ↗</h3><p>${esc(a.d)}</p></a>`).join("");
+}
+$("#aiChips").onclick=e=>{const b=e.target.closest("button");if(b){aiCat=b.dataset.c;renderAI()}};
+$("#prlist").innerHTML=PROMPTS.map(p=>`<div class="card"><h3>${esc(p.t)}</h3>${codeBlock(p.p)}</div>`).join("");
+$("#hulist").innerHTML=HUSTLE.map(h=>`<div class="card"><span class="tag g">idea</span><h3 style="margin-top:6px">${esc(h.t)}</h3><p>${esc(h.d)}</p></div>`).join("");
+
+/* ================= NOTES (db with local fallback) ================= */
+let NOTES=[],db=null,userId=null,notesCol=null;
+function localNotes(){try{return JSON.parse(localStorage.getItem("jv_notes")||"[]")}catch(e){return[]}}
+function saveLocal(){try{localStorage.setItem("jv_notes",JSON.stringify(NOTES))}catch(e){}}
+function renderNotes(){
+  const L=[...NOTES].sort((a,b)=>(a.done-b.done)||(b.ts-a.ts));
+  $("#notes").innerHTML=L.length?L.map(n=>`<div class="note ${n.done?"done":""}" data-id="${n.id}"><button data-act="t" title="Done">${n.done?"☑":"☐"}</button><p>${esc(n.text)}<small>${new Date(n.ts).toLocaleString("en-GB",{timeZone:"Africa/Nairobi",dateStyle:"medium",timeStyle:"short"})}</small></p><button data-act="d" title="Delete">✕</button></div>`).join(""):`<p class="hint">No notes yet.</p>`;
+}
+async function addNote(text){
+  text=text.trim();if(!text)return;
+  const n={id:"n"+Date.now()+Math.random().toString(36).slice(2,6),text,ts:Date.now(),done:false};
+  NOTES.push(n);renderNotes();
+  if(notesCol){try{await notesCol.doc(n.id).set({text:n.text,ts:n.ts,done:false})}catch(e){toast("Saved on this device only")}}else saveLocal();
+  return n;
+}
+$("#noteForm").onsubmit=e=>{e.preventDefault();addNote($("#noteIn").value);$("#noteIn").value=""};
+$("#notes").onclick=async e=>{
+  const b=e.target.closest("button[data-act]");if(!b)return;
+  const id=b.closest(".note").dataset.id;const n=NOTES.find(x=>x.id===id);if(!n)return;
+  if(b.dataset.act==="d"){NOTES=NOTES.filter(x=>x.id!==id);renderNotes();if(notesCol){try{await notesCol.doc(id).delete()}catch(e){}}else saveLocal()}
+  else{n.done=!n.done;renderNotes();if(notesCol){try{await notesCol.doc(id).update({done:n.done})}catch(e){}}else saveLocal()}
+};
+NOTES=localNotes();renderNotes();$("#noteWhere").textContent="Notes are saved in this browser.";
+
+/* ================= JARMOO BRAIN ================= */
+let sample=null,dict=null,tts=null,ttsOn=false,chatHist=[];
+const log=$("#log");
+function setState(s,label){$("#reactor").className="reactor "+s;$("#state").textContent=label}
+function md(t){return esc(t).replace(/`([^`]+)`/g,"<code>$1</code>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")}
+function addMsg(who,text){const d=document.createElement("div");d.className="msg "+who;d.innerHTML=(who==="j"?'<b class="who">JARMOO</b>':"")+'<span class="t">'+md(text)+"</span>";log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+let speaking=false;
+function speechText(t){return String(t).replace(/```[\s\S]*?```/g," (code shown on screen) ").replace(/[`*#_>|]/g,"").replace(/^[\s•\-–]+/gm,"").replace(/https?:\/\/\S+/g,"link on screen").replace(/\n{2,}/g,". ").replace(/\n/g,", ").slice(0,1900)}
+let lastSpoken="",speakEndAt=0,devVoiceOK=null;
+const LSg=(k,d)=>{try{const v=localStorage.getItem(k);return v===null?d:v}catch(e){return d}},LSs=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+const VOICES=[
+ {id:"butler",name:"AI Butler (British)",icon:"🎩",desc:"Calm, polished British voice with a Jarvis-style feel.",engine:"device",lang:"en-GB",prefer:[/ryan.*natural/i,/thomas.*natural/i,/google uk english male/i,/george/i,/ryan/i,/daniel/i,/arthur/i,/oliver/i,/male/i],rate:1.0,pitch:0.88,line:"Good evening, Moses. All systems are online and I'm watching the markets for you."},
+ {id:"commander",name:"Commander (deep)",icon:"🛡",desc:"Deep, slow, authoritative American voice.",engine:"device",lang:"en-US",prefer:[/guy.*natural/i,/christopher.*natural/i,/davis/i,/google us english/i,/david/i,/alex/i,/fred/i,/male/i],rate:0.94,pitch:0.68,line:"Commander online. London opens soon. Stick to the plan and protect your capital."},
+ {id:"swift",name:"Swift (fast)",icon:"⚡",desc:"Quick, energetic delivery for fast answers.",engine:"device",lang:"en-US",prefer:[/aria.*natural/i,/jenny.*natural/i,/google us english/i,/samantha/i,/zira/i],rate:1.32,pitch:1.05,line:"Swift mode! Short answers, fast delivery. What do you need?"},
+ {id:"lady",name:"Friendly (female)",icon:"🌸",desc:"Warm, clear British female voice.",engine:"device",lang:"en-GB",prefer:[/sonia.*natural/i,/libby.*natural/i,/google uk english female/i,/hazel/i,/serena/i,/kate/i,/female/i],rate:1.02,pitch:1.05,line:"Hello Moses, it's lovely to hear from you. How can I help today?"},
+ {id:"swahili",name:"Sauti ya Kiswahili",icon:"🇹🇿",desc:"Kiswahili voice. Best in Microsoft Edge (Rehema, Daudi) or with a Windows Kiswahili voice installed.",engine:"device",lang:"sw",prefer:[/rehema/i,/daudi/i,/zuri/i,/rafiki/i,/swahili|kiswahili/i],rate:1.0,pitch:1.0,line:"Habari Moses! Mimi ni Jarmoo, msaidizi wako. Nikusaidie nini leo?"},
+ {id:"claude-buttery",name:"Claude: Buttery",icon:"✦",desc:"Claude's own default voice. Smooth and natural.",engine:"claude",voice:"buttery",rate:1.05,line:"Hi Moses, this is Claude's buttery voice. Smooth and easy to listen to."},
+ {id:"claude-airy",name:"Claude: Airy",icon:"✦",desc:"Light, bright Claude voice.",engine:"claude",voice:"airy",rate:1.05,line:"Hi Moses, this is the airy voice. Light and bright."},
+ {id:"claude-glassy",name:"Claude: Glassy",icon:"✦",desc:"Crisp, clear Claude voice.",engine:"claude",voice:"glassy",rate:1.05,line:"Hi Moses, this is the glassy voice. Crisp and clear."},
+ {id:"claude-rounded",name:"Claude: Rounded",icon:"✦",desc:"Warm, full Claude voice.",engine:"claude",voice:"rounded",rate:1.05,line:"Hi Moses, this is the rounded voice. Warm and full."},
+ {id:"custom",name:"Custom device voice",icon:"🧩",desc:"Pick any voice installed on this phone or computer below.",engine:"device",custom:true,rate:1.0,pitch:1.0,line:"This is your custom voice choice, Moses."},
+ {id:"eleven",name:"ElevenLabs premium",icon:"💎",desc:"Studio-quality AI voices with your own ElevenLabs key. Standalone Jarmoo app only.",engine:"eleven",line:"This is your premium ElevenLabs voice. Ready when you are, Moses."}
+];
+const curProfile=()=>VOICES.find(v=>v.id===LSg("jv_voice","butler"))||VOICES[0];
+const devVoices=()=>("speechSynthesis" in window)?speechSynthesis.getVoices():[];
+function pickVoiceFor(p){const vs=devVoices();if(!vs.length)return null;if(p.custom){const n=LSg("jv_vcustom","");return vs.find(v=>v.name===n)||null}
+  const L=(p.lang||"en").toLowerCase();let pool=vs.filter(v=>(v.lang||"").toLowerCase().replace("_","-").startsWith(L));if(!pool.length&&L.length>2)pool=vs.filter(v=>(v.lang||"").toLowerCase().startsWith(L.slice(0,2)));
+  for(const re of p.prefer||[]){const f=pool.find(v=>re.test(v.name));if(f)return f}return pool[0]||null}
+function availability(p){if(p.engine==="claude")return (tts&&!window.JM_STANDALONE)?"ok":"claude";if(p.engine==="eleven")return !window.JM_STANDALONE?"standalone":(LSg("jm_el_key","")&&LSg("jm_el_voice",""))?"ok":"key";if(!devVoices().length)return "none";return pickVoiceFor(p)?"ok":(p.lang==="sw"?"nosw":p.custom?"pick":"ok")}
+function engineFor(p){const a=availability(p);if(a==="ok")return p.engine==="device"?"device":p.engine;if("speechSynthesis" in window&&devVoices().length)return "device";if(tts)return "claude";return "none"}
+function micStaysOpen(){return !!(hf.on&&engineFor(curProfile())!=="claude")}
+function useDevice(){return micStaysOpen()}
+let elAudio=null;
+async function elFetch(t){const r=await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(LSg("jm_el_voice",""))}?output_format=mp3_44100_128`,{method:"POST",headers:{"xi-api-key":LSg("jm_el_key",""),"content-type":"application/json",accept:"audio/mpeg"},body:JSON.stringify({text:t,model_id:LSg("jm_el_model","eleven_flash_v2_5")})});if(!r.ok)throw new Error("ElevenLabs "+r.status);return r.blob()}
+function playBlob(b){return new Promise(res=>{try{if(elAudio){elAudio.pause()}elAudio=new Audio(URL.createObjectURL(b));elAudio.playbackRate=+LSg("jv_vrate","1");elAudio.onended=elAudio.onerror=()=>res();elAudio.play().catch(()=>res())}catch(e){res()}})}
+function checkDevVoice(){return new Promise(res=>{if(!("speechSynthesis" in window)){devVoiceOK=false;return res(false)}let v=speechSynthesis.getVoices();if(v.length){devVoiceOK=true;return res(true)}let done=false;const fin=()=>{if(done)return;done=true;devVoiceOK=speechSynthesis.getVoices().length>0;res(devVoiceOK)};speechSynthesis.onvoiceschanged=fin;setTimeout(fin,700)})}
+
+function splitSentences(t){return String(t).match(/[^.!?…\n]+[.!?…]*[\s\n]*/g)||[String(t)]}
+const VO={q:[],busy:false,
+  enqueue(t,prof){t=speechText(t).replace(/\bJarmoo\b/gi,"I").trim();if(!t)return;const p=prof||curProfile();const it={t,p,eng:engineFor(p)};if(it.eng==="eleven")it.pre=elFetch(t).catch(()=>null);this.q.push(it);lastSpoken=(lastSpoken+" "+t).slice(-600);this.pump()},
+  async pump(){if(this.busy)return;const t=this.q.shift();if(t===undefined){if(speaking){speaking=false;speakEndAt=Date.now();onSpeakEnd()}return}
+    this.busy=true;speaking=true;setState("speak","SPEAKING");
+    try{await this.one(t)}catch(e){}
+    this.busy=false;this.pump()},
+  one(it){
+    const t=it.t,p=it.p,mr=+LSg("jv_vrate","1"),mp=+LSg("jv_vpitch","1");
+    if(it.eng==="eleven")return (async()=>{const b=await it.pre;if(b)await playBlob(b);else{it.eng="device";return this.one(it)}})();
+    if(it.eng==="device")return new Promise(res=>{try{speechSynthesis.resume()}catch(e){}const u=new SpeechSynthesisUtterance(t);const v=pickVoiceFor(p);if(v){u.voice=v;u.lang=v.lang}else if(p.lang)u.lang=p.lang;u.rate=Math.min(2,Math.max(.5,(p.rate||1)*mr));u.pitch=Math.min(2,Math.max(0,(p.pitch||1)*mp));let ok=false;const fin=()=>{if(!ok){ok=true;res()}};u.onend=fin;u.onerror=fin;speechSynthesis.speak(u);setTimeout(fin,3000+t.length*95/u.rate)});
+    if(it.eng==="claude"&&tts)return (async()=>{if(listening){try{await dict.stop()}catch(e){}}try{await tts.speak(t,{voice:p.voice||"buttery",rate:Math.min(1.5,Math.max(.7,(p.rate||1)*mr))})}catch(e){}})();
+    return Promise.resolve();
+  },
+  stop(){this.q=[];try{speechSynthesis.cancel()}catch(e){}try{tts&&tts.stop()}catch(e){}try{elAudio&&elAudio.pause()}catch(e){}},
+  preview(p){this.stop();this.busy=false;setTimeout(()=>this.enqueue(p.line,p),60)}
+};
+function onSpeakEnd(){setState(listening?"listen":"",hf.on?"HANDS-FREE":"STANDING BY");if(hf.on){hf.followUntil=Date.now()+20000;hintVoice(hf.wake?"Follow-up open for 20 s, or say “Jarmoo…”":"Listening…");if(!listening)hfResume(250)}}
+function say(text){if(!(ttsOn||hf.on)||engineFor(curProfile())==="none"){hfResume(300);return}splitSentences(text).forEach(x=>VO.enqueue(x))}
+function chime(f1,f2){try{actx=actx||new AudioContext();const t0=actx.currentTime;[f1||660,f2||990].forEach((f,i)=>{const o=actx.createOscillator(),g=actx.createGain();o.type="sine";o.frequency.value=f;g.gain.setValueAtTime(0.0001,t0+i*.09);g.gain.exponentialRampToValueAtTime(.09,t0+i*.09+.02);g.gain.exponentialRampToValueAtTime(.0001,t0+i*.09+.16);o.connect(g);g.connect(actx.destination);o.start(t0+i*.09);o.stop(t0+i*.09+.18)})}catch(e){}}
+function searchLib(q){
+  q=q.toLowerCase();const w=q.split(/\W+/).filter(x=>x.length>2);
+  const score=s=>w.reduce((a,x)=>a+(s.toLowerCase().includes(x)?1:0),0);
+  const all=[
+    ...EXCEL.map(x=>({m:"excel",s:score(x.t+" "+x.k+" "+x.d),txt:`[Excel] ${x.t}: ${x.f} — ${x.d}`})),
+    ...PC.map(x=>({m:"pc",s:score(x.t+" "+x.d+" "+x.c),txt:`[PC] ${x.t}: ${x.cmd} — ${x.d}`})),
+    ...PHONE.map(x=>({m:"phone",s:score(x.t+" "+x.s),txt:`[Phone] ${x.t}: ${x.s}`})),
+    ...AI.map(x=>({m:"ai",s:score(x.n+" "+x.d+" "+x.c),txt:`[AI tool] ${x.n} (${x.u}): ${x.d}`})),
+    ...Object.entries(KEYS).flatMap(([c,L])=>L.map(([a,k])=>({m:"keys",s:score(c+" "+a),txt:`[${c} shortcut] ${a}: ${k}`})))
+  ];
+  return all.filter(x=>x.s>0).sort((a,b)=>b.s-a.s).slice(0,8);
+}
+const MODNAMES={home:"home|console|jarvis|jarmoo|jarmoos|jormoos",forex:"forex|trading|trade|gold|xau|session|fx",vault:"vault|saves|instagram|collection|health|knowledge",voice:"voice studio|voices|voice|sauti",excel:"excel|formula|spreadsheet",pc:"pc|doctor|computer|windows|laptop|speed",keys:"shortcut|keys|keyboard|tally",type:"typing|type|dojo",phone:"phone|security|privacy|password|android",ai:"ai|tools|arsenal|prompt|hustle",notes:"notes|memory|tasks|todo"};
+function localCommand(q){
+  const t=q.toLowerCase().trim();
+  let m;
+  if(m=t.match(/^(open|show|go to|fungua)\s+(.+)/)){for(const[id,re]of Object.entries(MODNAMES))if(new RegExp(re).test(m[2])){openMod(id);return `Opening ${MODS.find(x=>x[0]===id)[2]}.`}}
+  if(m=q.match(/^(note|remember|kumbuka|add task|task)[:\s]+(.+)/i)){addNote(m[2]);return `Saved to your Memory Bank: "${m[2]}"`}
+  if(m=t.match(/^focus\s*(\d+)?/)){const n=+(m[1]||25);startFocus(n);return `Focus mode on for ${n} minutes. I'll tell you when it's done.`}
+  if(/^(what time|time|saa ngapi)/.test(t))return "It's "+$("#clock").textContent+" in Dar es Salaam.";
+  if(/^(read|show|list).*(notes|tasks)/.test(t)){const o=NOTES.filter(n=>!n.done);return o.length?"Open items:\n"+o.map(n=>"• "+n.text).join("\n"):"Your Memory Bank is clear."}
+  if(/\b(lot|lots|position size|lot size)\b/.test(t)&&/\d/.test(t)){
+    const n=x=>parseFloat(String(x).replace(/,/g,""));
+    const bm=t.match(/\$\s?([\d,]+(?:\.\d+)?)/)||t.match(/([\d,]+(?:\.\d+)?)\s*(?:dollars|usd|account|balance)/)||t.match(/balance\s*(?:of\s*)?([\d,]+)/);
+    const rm=t.match(/([\d.]+)\s*(?:%|percent|per cent|asilimia)/);
+    const sm=t.match(/stop(?:\s*-?\s*loss)?\s*(?:of\s*|at\s*)?\$?\s?([\d.]+)/);
+    const SY=[[/gold|xau/,"XAUUSD"],[/euro|eur\s*\/?\s*usd|eurusd/,"EURUSD"],[/pound|cable|gbp\s*\/?\s*usd|gbpusd/,"GBPUSD"],[/aussie|aud\s*\/?\s*usd|audusd/,"AUDUSD"],[/kiwi|nzd/,"NZDUSD"],[/usd\s*\/?\s*cad|usdcad|loonie/,"USDCAD"],[/usd\s*\/?\s*chf|usdchf|swissy/,"USDCHF"]];
+    const sy=(SY.find(([re])=>re.test(t))||[0,null])[1];
+    if(bm&&rm&&sm&&sy){
+      const tool=TOOLS.find(x=>x.name==="position_size");const r=tool.execute({balance:n(bm[1]),risk_pct:n(rm[1]),symbol:sy,stop_distance:n(sm[1]),direction:/sell|short/.test(t)?"sell":"buy"});
+      openMod("forex");openFx("risk");
+      if(r.error)return "I couldn't size that: "+r.error;
+      return `For $${n(bm[1]).toLocaleString()} at ${n(rm[1])}% risk on ${sy} with a ${r.stop_distance} stop: **${r.lots.toFixed(2)} lots**, risking $${r.money_at_risk_usd}. ${r.lots<0.01?"That stop is too wide for this balance, so skip it or tighten the stop.":"The 1:2 and 1:3 targets are in the calculator once you add your entry price."}`;
+    }
+    if(!sy||!bm||!rm||!sm)return "Tell me the balance, risk %, pair and stop. For example: “lot size, 1000 dollars, 1 percent, gold, stop 5”.";
+  }
+  if(/\b(list|what|which|show)\b.*\bvoices?\b|\bsauti gani\b/.test(t)){openMod("voice");return "My voices: "+VOICES.filter(v=>availability(v)==="ok").map(v=>v.name).join(", ")+". Say, for example, “change voice to butler”."}
+  if(m=t.match(/(?:change|switch|set|use|badilisha|tumia)\s+(?:the\s+|your\s+|my\s+)?(?:voice|sauti)\s*(?:to|into|kuwa|ya)?\s*(.*)$/)||t.match(/^(?:use|tumia|switch to)\s+(?:the\s+)?(.+?)\s+(?:voice|sauti)$/)){
+    const w=(m[1]||"").trim();const MAP=[[/butler|jarvis|british|uk|english/,"butler"],[/deep|commander|bass|boss/,"commander"],[/fast|swift|quick/,"swift"],[/female|lady|woman|girl|friendly/,"lady"],[/swahili|kiswahili/,"swahili"],[/airy/,"claude-airy"],[/glassy/,"claude-glassy"],[/rounded|round/,"claude-rounded"],[/claude|buttery|your/,"claude-buttery"],[/eleven|premium/,"eleven"],[/custom/,"custom"]];
+    const id=(MAP.find(([re])=>re.test(w))||[])[1];
+    if(!id){openMod("voice");return "Which voice? I have butler, commander, swift, friendly female, Kiswahili, Claude buttery, airy, glassy and rounded, plus custom and premium."}
+    const pr=VOICES.find(v=>v.id===id);const a=availability(pr);
+    if(a==="claude")return "Claude's own voices only work inside the Claude version of Jarmoo. Try “change voice to butler”.";
+    if(a==="standalone")return "Premium ElevenLabs voices only work in the standalone Jarmoo app.";
+    if(a==="key"){openMod("voice");return "Add your ElevenLabs key and choose a voice in Voice Studio first."}
+    LSs("jv_voice",id);renderVoiceStudio();
+    return a==="nosw"?"No Kiswahili voice is installed on this device, so I'll use the closest one. Microsoft Edge has Rehema and Daudi.":(id==="swahili"?"Sawa Moses, sasa nitaongea kwa sauti hii.":`Voice changed to ${pr.name}. How do I sound, Moses?`);
+  }
+  if(/^(forex|open forex|trading)$/.test(t)){openMod("forex");return "Forex Command Center open. "+fxStatus().advice}
+  if(/speed up|slow (pc|laptop|computer)/.test(t)){openMod("pc");return "Opened PC Doctor. Quickest wins: 1) Ctrl+Shift+Esc → Startup apps → disable extras, 2) clean temp files, 3) run `sfc /scannow`. Or download the Jarmoo Toolkit there and pick options 1, 2 and 8."}
+  return null;
+}
+const SYSTEM=`You are Jarmoo (a name Moses created; introduce yourself as Jarmoo), the personal assistant of Moses Musa Mshana ("King Morsy"), a CPA(T) Head of Finance & Administration at Rahami Agri Group in Dar es Salaam, Tanzania. He speaks English and Swahili; reply in the language he uses. Be concise, practical and warm with a light Iron-Man JARVIS-like style ("Sir" occasionally, not every line). Prefer short answers with exact steps, formulas, commands or keys. Use **bold** and \`code\` only (no headings, no tables). Currency TZS, VAT 18%.
+His Jarmoo app has modules: forex (sessions/alerts, risk calculator, entry checklist, AI chart analyst, playbook, journal, his forex saves, safety), vault (all Instagram saves), excel (formula library + builder), pc (Windows repair/speed commands + PowerShell toolkit), keys (shortcuts trainer incl. Tally Prime), type (typing test), phone (phone tips, privacy, password checker), ai (AI tools, prompts, hustle ideas), notes (memory bank).
+FOREX (top priority for Moses): he trades forex & gold (XAUUSD) and wants clear timing, entries, exits and % risk. Always use forex_now for anything about timing/sessions/"should I trade now" and position_size for lot sizes. Teach his rules: risk 0.5–1% per trade (never >2%), daily stop −3%, SL at broker always, move to break-even at +1R, take 50% at 1:2, no trades 30 min before red news or at rollover, best gold window = London–NY overlap (≈16:00–20:00 EAT in winter). You cannot see live prices: never invent current prices or claim a live signal; give conditional plans (if price does X at level Y, then...) and point him to the Forex Command → Entry Checklist / AI Chart Analyst (he can upload a chart screenshot) and TradingView/MT5 alerts. Be honest that most retail traders lose; educational, not financial advice — but don't lecture, keep it to one short line.
+His Instagram saves (4,141 posts in 42 collections: health, knowledge, forex, business, opportunity room, love, faith, memories, news…) are in his Life Vault: use search_vault whenever he asks about something he saved or about health/knowledge/business topics, and cite the @account.
+Tools: use search_library first for tech/Excel/PC/phone questions so answers match his library; use open_module when he asks to open/show something or when a module would help; use add_note when he asks to remember/note/add a task; use read_notes when he asks about his notes/tasks. Never help with software piracy, Windows activation cracks, hacking others' Wi-Fi/accounts or free illegal streaming; offer the legitimate route instead.`;
+const TOOLS=[
+ {name:"search_library",description:"Search Moses's saved tech library (Excel tricks, PC commands, phone tips, AI tools, shortcuts). Returns matching items.",inputSchema:{type:"object",properties:{query:{type:"string"}},required:["query"]},execute:({query})=>({results:searchLib(query).map(r=>r.txt)})},
+ {name:"open_module",description:"Open a module in the Jarmoo app: home, forex, vault, excel, pc, keys, type, phone, ai, notes.",inputSchema:{type:"object",properties:{module:{type:"string",enum:["home","forex","vault","excel","pc","keys","type","phone","ai","notes"]}},required:["module"]},execute:({module})=>{openMod(module);return {opened:module}}},
+ {name:"forex_now",description:"Live forex market status in EAT: which sessions are open, quality of the current time to trade, upcoming session opens/closes, next NFP, and today's session times.",inputSchema:{type:"object",properties:{}},execute:()=>{const st=fxStatus();const now=Date.now();const today=SESS.map(x=>{const iv=sessIntervals(x,now).filter(i=>i.c>now-12*36e5).sort((a,b)=>a.o-b.o)[0];return iv?`${x.n} ${fT(iv.o)}-${fT(iv.c)} EAT`:x.n})
+   ;return {now_eat:fT(now)+" "+fD(now),market_open:st.open,active:st.active,quality:st.quality,advice:st.advice,upcoming:st.up.slice(0,6).map(e=>`${e.label} at ${fT(e.t)} EAT ${fD(e.t)} (in ${dur(e.t-now)})`),sessions_today:today,next_nfp:st.nfp?fD(st.nfp)+" "+fT(st.nfp)+" EAT":null}}},
+ {name:"position_size",description:"Calculate lot size for a trade. Uses the Risk Calculator. symbol one of: EURUSD,GBPUSD,AUDUSD,NZDUSD,XAUUSD,USDJPY,USDCAD,USDCHF,EURJPY,GBPJPY,AUDJPY. Give entry & stop prices, or stop_distance (pips; for XAUUSD in $ price).",inputSchema:{type:"object",properties:{balance:{type:"number"},risk_pct:{type:"number"},symbol:{type:"string"},direction:{type:"string",enum:["buy","sell"]},entry:{type:"number"},stop:{type:"number"},stop_distance:{type:"number"},usdjpy_rate:{type:"number"}},required:["balance","risk_pct","symbol"]},execute:(a)=>{const i=SYMS.findIndex(x=>x[0].replace(/ .*/,"")===String(a.symbol).toUpperCase().replace("/",""));if(i<0)return{error:"unsupported symbol"};$("#rBal").value=a.balance;$("#rPct").value=a.risk_pct;$("#rSym").value=i;$("#rDir").value=a.direction==="sell"?-1:1;$("#rEntry").value=a.entry??"";$("#rStop").value=a.stop??"";$("#rPips").value=a.stop_distance??"";if(a.usdjpy_rate)$("#rRate").value=a.usdjpy_rate;const r=calcRisk();return r?{lots:r.lots,money_at_risk_usd:+r.actual.toFixed(2),stop_distance:r.dist.toFixed(1)+" "+r.unit,tp_1to2:r.tp1,tp_1to3:r.tp2}:{error:"missing inputs (need entry for USD-base pairs, USDJPY rate for JPY crosses)"}}},
+ {name:"search_vault",description:"Search Moses's 4,141 saved Instagram posts across 42 collections (health, knowledge, forex, business, opportunity room, love, faith, memories, news, etc). Optional collection slug filter, e.g. health-and-lesson, forex-trick-and-online-money, knowledge, opportunity-room, business-idea, financials-skills, love-section, holly-knowledge-and-pry.",inputSchema:{type:"object",properties:{query:{type:"string"},collection:{type:"string"}},required:["query"]},execute:async({query,collection})=>{await loadVault();const ci=collection?VAULT.cols.findIndex(c=>c[0]===collection):-1;return {results:vaultSearch(query,ci,12).map(i=>`[${VAULT.cols[i[0]][1]}] @${i[1]}: ${(i[3]||"(video)").slice(0,500)}`)}}},
+ {name:"add_note",description:"Save a note or task to Moses's Memory Bank.",inputSchema:{type:"object",properties:{text:{type:"string"}},required:["text"]},execute:async({text})=>{await addNote(text);return {saved:text}}},
+ {name:"read_notes",description:"Read Moses's saved notes and tasks.",inputSchema:{type:"object",properties:{}},execute:()=>({notes:NOTES.map(n=>({text:n.text,done:n.done,when:new Date(n.ts).toISOString()}))})}
+];
+let busy=false;
+async function ask(q){
+  q=q.trim();if(!q||busy)return;
+  addMsg("u",q);
+  const local=localCommand(q);
+  if(local){addMsg("j",local);say(local);return}
+  if(!sample){
+    const parts=[];
+    if(/forex|trade|trading|gold|xau|session|london|new york|nfp|market|soko/i.test(q)){const st=fxStatus();parts.push(`📈 Market now: **${st.quality}** (${st.active.join(" + ")||"no session open"}). ${st.advice}\nNext: `+st.up.slice(0,3).map(e=>`${e.label} ${fT(e.t)} EAT`).join(" · "))}
+    const hits=searchLib(q).filter(h=>h.s>=Math.min(2,q.split(/\s+/).filter(w=>w.length>2).length));if(hits.length)parts.push("From your library:\n"+hits.slice(0,3).map(h=>"• "+h.txt).join("\n"));
+    if(VAULT){const v=vaultSearch(q,-1,3);if(v.length)parts.push("From your Instagram saves:\n"+v.map(i=>`• [${VAULT.cols[i[0]][1]}] @${i[1]}: ${(i[3]||"").slice(0,220)}`).join("\n"))}
+    const r=parts.length?parts.join("\n\n"):"I'm in offline mode (no AI brain connected). Try “forex”, “open vault”, “note …”, “focus 25”, or search a module.";
+    addMsg("j",r);say(r.slice(0,400));return;
+  }
+  busy=true;setState("think","THINKING");
+  const el=addMsg("j","…");const span=el.querySelector(".t");
+  const streamSpeak=hf.on||ttsOn;let spokenIdx=0;let filler=null;
+  if(hf.on)filler=setTimeout(()=>{if(spokenIdx===0&&busy)VO.enqueue("One moment.")},2600);
+  const speakStream=(text)=>{if(!streamSpeak||!text||/^Thinking/.test(text)||text.length<=spokenIdx)return;const rest=text.slice(spokenIdx);const m=rest.match(/^[\s\S]*[.!?…](?=\s|$)|^[\s\S]*\n/);if(m&&m[0].trim().length>=18){spokenIdx+=m[0].length;splitSentences(m[0]).forEach(x=>VO.enqueue(x))}};
+  chatHist.push({role:"user",content:q});
+  const msgs=chatHist.map((m,i)=>i===0?{role:"user",content:SYSTEM+"\n\n---\nMoses says:\n"+m.content}:m);
+  if(hf.on){const L=msgs[msgs.length-1];msgs[msgs.length-1]={role:"user",content:L.content+"\n\n(Spoken conversation: reply in 1–4 short natural sentences that sound good read aloud, no lists, tables or symbols. If useful, end with a short follow-up question so we can keep discussing.)"}}
+  try{
+    const opt={tools:TOOLS,cache:false,onText:({text})=>{span.innerHTML=md(text);log.scrollTop=log.scrollHeight;speakStream(text)}};if(hf.on)opt.modelTier="quick";
+    const res=await sample(msgs,opt);clearTimeout(filler);
+    span.innerHTML=md(res.text);
+    chatHist.push({role:"assistant",content:res.text});
+    if(chatHist.length>16)chatHist=chatHist.slice(-16);
+    if(chatHist[0].role!=="user")chatHist.shift();
+    if(!speaking)setState("","STANDING BY");
+    if(streamSpeak){if(res.text.length>spokenIdx)splitSentences(res.text.slice(spokenIdx)).forEach(x=>VO.enqueue(x))}
+  }catch(err){clearTimeout(filler);
+    chatHist.pop();
+    span.textContent=err&&err.code==="rate_limited"?"I'm being rate-limited. Give me a moment, Sir.":err&&err.code==="not_granted"?"AI access wasn't allowed. Local commands and the library still work.":"Something went wrong reaching my brain. Try again.";
+    if(err&&err.code==="not_granted")sample=null;
+    setState("","STANDING BY");say(span.textContent);
+  }
+  busy=false;if(hf.on&&!speaking)hfResume(200);
+}
+$("#askForm").onsubmit=e=>{e.preventDefault();const v=$("#ask").value;$("#ask").value="";ask(v)};
+const QUICK=["Lot size, 1000 dollars, 1 percent, gold, stop 5","Is now a good time to trade gold?","Lot size: $1000, 1% risk, XAUUSD stop $5","What health tips did I save?","What can you do?","Formula for age from date of birth","My laptop is slow","Tally shortcut for payment voucher","Best free AI for slides","focus 25","note Review October bank reconciliation","read my notes"];
+$("#quick").innerHTML=QUICK.map(q=>`<button>${esc(q)}</button>`).join("");
+$("#quick").onclick=e=>{const b=e.target.closest("button");if(b)ask(b.textContent)};
+
+/* Excel builder */
+$("#xbBtn").onclick=async()=>{
+  const q=$("#xb").value.trim();if(!q)return;
+  const out=$("#xbOut");
+  if(!sample){const h=searchLib(q).filter(x=>x.m==="excel");out.innerHTML=h.length?h.slice(0,3).map(x=>`<p class="hint" style="margin-top:8px">${esc(x.txt)}</p>`).join(""):`<p class="hint" style="margin-top:8px">AI isn't available here. Search the library below.</p>`;return}
+  out.innerHTML=`<p class="hint" style="margin-top:8px">Building…</p>`;
+  try{
+    const r=await sample.json(`You are an Excel expert. Task from a finance officer in Tanzania: "${q}". Return JSON only: {"formula": string (one formula, or short steps if not a formula), "explain": string (2-4 short sentences, plain words), "alt": string (alternative for older Excel, or empty)}.`,{cache:false});
+    out.innerHTML=codeBlock(r.formula||"")+`<p style="margin-top:8px">${esc(r.explain||"")}</p>`+(r.alt?`<p class="hint" style="margin-top:6px">Older Excel: <span class="mono">${esc(r.alt)}</span></p>`:"");
+  }catch(e){out.innerHTML=`<p class="hint" style="margin-top:8px">Couldn't build it right now. Try again.</p>`}
+};
+
+/* ================= VOICE ================= */
+let listening=false,heard="";
+const hf={on:false,wake:true,followUntil:0,needTap:false};
+try{hf.wake=localStorage.getItem("jv_hfwake")!=="0";$("#hfWake").checked=hf.wake;$("#hfAuto").checked=localStorage.getItem("jv_hfauto")==="1"}catch(e){}
+$("#hfWake").onchange=e=>{hf.wake=e.target.checked;try{localStorage.setItem("jv_hfwake",hf.wake?"1":"0")}catch(_){}};
+$("#hfAuto").onchange=e=>{try{localStorage.setItem("jv_hfauto",e.target.checked?"1":"0")}catch(_){}};
+function hintVoice(t){$("#voiceHint").textContent=t}
+function startDict(){
+  if(!dict||listening)return;
+  hf.needTap=false;
+  dict.start(hf.on?{continuous:true}:undefined).catch(e=>{
+    if(e&&e.code==="not_granted"){toast("Microphone not allowed");hfOff(false);dict=null;$("#micBtn").style.display="none";return}
+    if(hf.on){hf.needTap=true;setState("","TAP TO LISTEN");hintVoice("Tap the core once to keep listening")}
+  });
+}
+function micBlocked(){return (busy||speaking)&&!micStaysOpen()}
+function hfResume(delay){if(!hf.on||micBlocked())return;setTimeout(()=>{if(hf.on&&!micBlocked()&&!listening)startDict()},delay||300)}
+setInterval(()=>{if(hf.on&&dict&&!listening&&!hf.needTap&&!micBlocked()&&document.visibilityState==="visible")startDict()},2500);
+async function hfOn(){
+  if(!dict){toast("Voice input isn't available here. Use Chrome, the Claude desktop app or the Jarmoo app.");return}
+  hf.on=true;
+  startDict();                      /* must run straight from the tap */
+  chime(523,784);try{actx&&actx.resume()}catch(e){}
+  $("#hfBtn").classList.add("on");$("#hfBtn").textContent="🎧 Hands-free ON (tap to stop)";
+  setState("listen","HANDS-FREE");hintVoice(hf.wake?"Say “Jarmoo…” then your request":"Just talk, I'm listening");
+  openMod("home");
+  if(devVoiceOK===null)await checkDevVoice();
+  say(hf.wake?"Hands-free on. Say Jarmoo, then your request.":"Hands-free on. I'm listening.");
+}
+function hfOff(speak){hf.on=false;VO.stop();clearTimeout(partialTimer);$("#hfBtn").classList.remove("on");$("#hfBtn").textContent="🎧 Start hands-free";try{dict&&dict.stop()}catch(e){}setState("","STANDING BY");hintVoice("Tap the core for hands-free mode");if(speak)say("Going quiet. Tap the core when you need me.")}
+/* fuzzy wake word: speech-to-text spells "Jarmoo" many ways */
+const WAKE_FORMS=["jarmoo","jarmu","jamu","jamoo","jarmo","jaramu","jarumu","jahmu","jarvis","jamuu","jarmon","yarmu","jarmuh"];
+const FILLERS=new Set(["hey","ok","okay","hello","hi","yo","eh","sema","habari","oya","please","so","um","uh","ah"]);
+function lev(a,b){const m=a.length,n=b.length;if(!m)return n;if(!n)return m;let p=Array.from({length:n+1},(_,j)=>j);for(let i=1;i<=m;i++){const c=[i];for(let j=1;j<=n;j++)c[j]=Math.min(p[j]+1,c[j-1]+1,p[j-1]+(a[i-1]===b[j-1]?0:1));p=c}return p[n]}
+const squash=w=>w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z]/g,"").replace(/(.)\1+/g,"$1");
+const WAKE_SQ=[...new Set(WAKE_FORMS.map(squash))];
+function isWakeToken(t){const s=squash(t);if(s.length<3||s.length>8)return false;if(/^(jam|jar|arm|am)$/.test(s))return false;return WAKE_SQ.some(f=>lev(s,f)<=(f.length>=5?2:1)&&s[0]===f[0]||s===f)}
+function detectWake(text){
+  const raw=String(text).split(/\s+/).filter(Boolean);const words=raw.map(w=>w.replace(/[^\p{L}\p{N}']/gu,""));
+  const idx=[];for(let i=0;i<words.length&&idx.length<3;i++){if(FILLERS.has(words[i].toLowerCase()))continue;idx.push(i)}
+  if(words.length)idx.push(words.length-1);
+  for(const i of idx){for(const span of [1,2]){if(i+span>words.length)continue;const cand=words.slice(i,i+span).join("");if(isWakeToken(cand)){const rest=raw.slice(0,i).filter(w=>!FILLERS.has(w.replace(/[^\p{L}]/gu,"").toLowerCase())).concat(raw.slice(i+span)).join(" ").replace(/^[\s,.!?:;-]+/,"").trim();return{hit:true,rest}}}}
+  return{hit:false,rest:text};
+}
+const normT=t=>String(t).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu," ").replace(/\s+/g," ").trim();
+function echoLike(t){if(!lastSpoken||Date.now()-speakEndAt>8000&&!speaking)return false;const a=new Set(normT(lastSpoken).split(" "));const w=normT(t).split(" ").filter(Boolean);if(w.length<2)return false;return w.filter(x=>a.has(x)).length/w.length>=.6}
+let lastProc={t:"",at:0},partialTimer=null,chimed=false;
+function hfPartial(text){
+  const w=detectWake(text);
+  if(speaking&&!w.hit)return;
+  if(w.hit&&!chimed){chimed=true;chime(880,1320);if(speaking)VO.stop();setState("listen","YES, MOSES?")}
+  hintVoice("🎙 "+text);
+  clearTimeout(partialTimer);partialTimer=setTimeout(()=>hfProcess(text),1300);
+}
+function hfHeard(text){clearTimeout(partialTimer);hfProcess(text)}
+async function hfProcess(text){
+  chimed=false;text=(text||"").trim();if(!text)return;
+  const n=normT(text),now=Date.now();
+  if(lastProc.t&&now-lastProc.at<6000&&(n===lastProc.t||n.startsWith(lastProc.t)||lastProc.t.startsWith(n)))return;
+  const w=detectWake(text);
+  if(speaking){if(!w.hit)return;VO.stop()}
+  else if(!w.hit&&(now-speakEndAt<1200||echoLike(text)))return;
+  const low=n;
+  if(/\b(stop listening|go to sleep|sleep mode|goodbye|good bye|lala sasa|acha kusikiliza)\b/.test(low)){lastProc={t:n,at:now};hfOff(true);return}
+  const cmd=w.hit?w.rest:text;
+  const addressed=w.hit||!hf.wake||now<hf.followUntil;
+  if(!addressed){hintVoice("Heard: “"+text.slice(0,40)+"”. Say “Jarmoo” first");return}
+  lastProc={t:n,at:now};
+  if(/^(stop|cancel|never ?mind|nyamaza|basi|shut up|quiet)[.!]?$/i.test(cmd)){VO.stop();hf.followUntil=0;return}
+  if(!cmd){hf.followUntil=now+15000;say("Yes, Moses?");return}
+  if(busy)return;
+  chime(740,988);hintVoice("💭 "+cmd);
+  if(!useDevice()){try{await dict.stop()}catch(e){}}
+  await ask(cmd);
+}
+async function toggleMic(){
+  if(!dict){toast("Voice input isn't available here, please type instead");return}
+  if(hf.on){hfOff(false)}
+  if(listening){try{await dict.stop()}catch(e){}return}
+  heard="";startDict();
+}
+$("#micBtn").onclick=toggleMic;
+$("#hfBtn").onclick=()=>{hf.on?hfOff(true):hfOn()};
+$("#reactor").onclick=()=>{
+  if(speaking){VO.stop();return}
+  if(hf.on&&hf.needTap){startDict();return}
+  hf.on?hfOff(true):hfOn();
+};
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&speaking)VO.stop()});
+let autoArmed=false;
+function armAuto(){if(autoArmed)return;autoArmed=true;try{if(localStorage.getItem("jv_hfauto")!=="1")return}catch(e){return}
+  hintVoice("Tap anywhere to start hands-free");
+  const go=()=>{document.removeEventListener("pointerdown",go,true);document.removeEventListener("keydown",go,true);if(!hf.on)hfOn()};
+  document.addEventListener("pointerdown",go,true);document.addEventListener("keydown",go,true);}
+$("#ttsBtn").onclick=()=>{
+  if(!tts&&!("speechSynthesis" in window)){toast("Spoken replies aren't available in this view");return}
+  ttsOn=!ttsOn;$("#ttsBtn").classList.toggle("on",ttsOn);$("#ttsBtn").textContent=ttsOn?"🔊":"🔈";
+  try{localStorage.setItem("jv_tts",ttsOn?"1":"0")}catch(e){}
+  if(ttsOn)say("Voice online. At your service, Moses.");else VO.stop();
+};
+
+/* ================= VOICE STUDIO ================= */
+const AV_LABEL={ok:["Available","var(--ok)"],claude:["Claude version only","var(--gold)"],standalone:["Standalone app only","var(--gold)"],key:["Needs your key","var(--gold)"],none:["No voices on this device","var(--bad)"],nosw:["No Kiswahili voice here, uses closest","var(--gold)"],pick:["Choose a voice below","var(--gold)"]};
+function renderVoiceStudio(){
+  const cur=curProfile().id;
+  $("#vsList").innerHTML=VOICES.map(v=>{const a=availability(v);const [lab,col]=AV_LABEL[a]||AV_LABEL.ok;const dv=v.engine==="device"?pickVoiceFor(v):null;
+    return `<div class="card" style="${v.id===cur?"border-color:var(--cy);box-shadow:0 0 0 2px rgba(51,214,255,.18)":""}"><h3>${v.icon} ${esc(v.name)} ${v.id===cur?'<span class="tag">IN USE</span>':""}</h3><p>${esc(v.desc)}</p>
+    <p class="hint" style="margin-top:6px"><span style="color:${col}">● ${lab}</span>${dv?` · ${esc(dv.name)}`:""}</p>
+    <div class="row" style="margin-top:8px"><button class="btn ghost" data-vprev="${v.id}">▶ Preview</button><button class="btn" data-vuse="${v.id}" ${v.id===cur?"disabled":""}>✓ Use</button></div></div>`}).join("");
+  const vs=devVoices();$("#vsCustom").innerHTML=vs.length?vs.map(v=>`<option ${v.name===LSg("jv_vcustom","")?"selected":""}>${esc(v.name)}</option>`).join(""):"<option>No device voices found</option>";
+  [...$("#vsCustom").options].forEach((o,i)=>{if(vs[i])o.textContent=`${vs[i].name} (${vs[i].lang})`;o.value=vs[i]?vs[i].name:""});
+  const r=+LSg("jv_vrate","1"),pt=+LSg("jv_vpitch","1");$("#vsRate").value=r;$("#vsPitch").value=pt;$("#vsRateV").textContent=r.toFixed(2)+"×";$("#vsPitchV").textContent=pt.toFixed(2)+"×";
+  const el=$("#vsEleven");
+  if(!window.JM_STANDALONE){el.innerHTML=`<h3>💎 Premium voices (ElevenLabs)</h3><p>Studio-quality AI voices are available in the <b>standalone Jarmoo app</b> (Jarmoo.html or your installed app), using your own ElevenLabs key. This Claude version can't reach outside services. Here you can use the four Claude voices above.</p>`}
+  else{el.innerHTML=`<h3>💎 Premium voices (ElevenLabs)</h3><p>Paste your own key from <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener">elevenlabs.io</a> (a free tier is available; paid plans for more minutes), load your voices and pick one. The key stays on this device.</p>
+    <div class="fgrid" style="margin-top:8px"><label>ElevenLabs API key<input type="password" id="elKey" placeholder="xi-…" value="${LSg("jm_el_key","")?"••••••••":""}"></label><label>Voice<select id="elVoice"><option value="">Load voices first</option></select></label></div>
+    <div class="row" style="margin-top:8px"><button class="btn ghost" id="elLoad">Load my voices</button><button class="btn" id="elUse">✓ Use premium voice</button><span class="hint" id="elMsg"></span></div>`;
+    const cached=JSON.parse(LSg("jm_el_list","[]"));if(cached.length){$("#elVoice").innerHTML=cached.map(v=>`<option value="${esc(v.id)}" ${v.id===LSg("jm_el_voice","")?"selected":""}>${esc(v.name)}${v.desc?" · "+esc(v.desc):""}</option>`).join("")}
+    $("#elLoad").onclick=async()=>{const k=$("#elKey").value.trim();if(k&&!k.startsWith("•"))LSs("jm_el_key",k);$("#elMsg").textContent="Loading…";try{const r=await fetch("https://api.elevenlabs.io/v1/voices",{headers:{"xi-api-key":LSg("jm_el_key","")}});if(!r.ok)throw r.status;const j=await r.json();const L=(j.voices||[]).map(v=>({id:v.voice_id,name:v.name,desc:[v.labels&&v.labels.accent,v.labels&&v.labels.gender,v.labels&&v.labels.description].filter(Boolean).join(", ")}));LSs("jm_el_list",JSON.stringify(L));renderVoiceStudio();$("#elMsg").textContent=L.length+" voices loaded. Tip: pick a calm British male for a butler feel."}catch(e){$("#elMsg").textContent="Couldn't load voices: check the key."}};
+    $("#elUse").onclick=()=>{const k=$("#elKey").value.trim();if(k&&!k.startsWith("•"))LSs("jm_el_key",k);const v=$("#elVoice").value;if(!v){$("#elMsg").textContent="Load and choose a voice first.";return}LSs("jm_el_voice",v);LSs("jv_voice","eleven");renderVoiceStudio();VO.preview(VOICES.find(x=>x.id==="eleven"))};
+    $("#elVoice").onchange=e=>{if(e.target.value)LSs("jm_el_voice",e.target.value)};
+  }
+}
+$("#vsList").onclick=e=>{const pv=e.target.closest("[data-vprev]"),us=e.target.closest("[data-vuse]");
+  if(pv){const v=VOICES.find(x=>x.id===pv.dataset.vprev);const a=availability(v);if(a==="claude"||a==="standalone"||a==="key"){toast(AV_LABEL[a][0]);return}VO.preview(v)}
+  if(us){const v=VOICES.find(x=>x.id===us.dataset.vuse);const a=availability(v);if(a==="claude"||a==="standalone"||a==="key"){toast(AV_LABEL[a][0]);return}LSs("jv_voice",v.id);renderVoiceStudio();VO.preview(v);toast("Voice: "+v.name)}};
+$("#vsRate").oninput=e=>{LSs("jv_vrate",e.target.value);$("#vsRateV").textContent=(+e.target.value).toFixed(2)+"×"};
+$("#vsPitch").oninput=e=>{LSs("jv_vpitch",e.target.value);$("#vsPitchV").textContent=(+e.target.value).toFixed(2)+"×"};
+$("#vsCustom").onchange=e=>{LSs("jv_vcustom",e.target.value);renderVoiceStudio()};
+$("#vsSpeak").onclick=()=>{VO.stop();VO.busy=false;setTimeout(()=>VO.enqueue($("#vsTest").value),60)};
+$("#vsStop").onclick=()=>VO.stop();
+$("#vsReset").onclick=()=>{LSs("jv_vrate","1");LSs("jv_vpitch","1");renderVoiceStudio()};
+if("speechSynthesis" in window){speechSynthesis.addEventListener?speechSynthesis.addEventListener("voiceschanged",()=>{devVoiceOK=devVoices().length>0;renderVoiceStudio()}):0}
+setTimeout(()=>{checkDevVoice().then(()=>renderVoiceStudio())},300);
+
+/* ================= DOWNLOAD PS1 ================= */
+let downloads=null;
+$("#dlPs").onclick=async()=>{
+  if(!downloads){copyText(PS1);toast("Download not available here, so the script was copied. Paste it into Notepad and save as Jarmoo-Toolkit.ps1");return}
+  try{await downloads.save({filename:"Jarmoo-Toolkit.ps1",data:PS1});toast("Saved ✔")}catch(e){toast("Download cancelled")}
+};
+
+/* ================= FOREX ENGINE ================= */
+const EAT="Africa/Nairobi";
+function tzParts(ts,tz){const f=new Intl.DateTimeFormat("en-GB",{timeZone:tz,hourCycle:"h23",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});const p={};f.formatToParts(new Date(ts)).forEach(x=>p[x.type]=x.value);return{y:+p.year,m:+p.month,d:+p.day,h:+p.hour,mi:+p.minute,s:+p.second}}
+function tzOff(ts,tz){const p=tzParts(ts,tz);return Date.UTC(p.y,p.m-1,p.d,p.h,p.mi,p.s)-Math.floor(ts/1000)*1000}
+function zoned(y,m,d,h,mi,tz){const g=Date.UTC(y,m-1,d,h,mi);let t=g-tzOff(g,tz);return g-tzOff(t,tz)}
+const fT=ts=>new Date(ts).toLocaleTimeString("en-GB",{timeZone:EAT,hour:"2-digit",minute:"2-digit"});
+const fD=ts=>new Date(ts).toLocaleDateString("en-GB",{timeZone:EAT,weekday:"short",day:"numeric",month:"short"});
+function dur(ms){ms=Math.max(0,ms);const h=Math.floor(ms/36e5),m=Math.floor(ms%36e5/6e4);return (h?h+"h ":"")+m+"m"}
+const SESS=[
+ {k:"sydney",n:"Sydney",tz:"Australia/Sydney",o:7,c:16,col:"#7c6cff",best:"AUD, NZD pairs; quiet for most"},
+ {k:"tokyo",n:"Tokyo",tz:"Asia/Tokyo",o:9,c:18,col:"#ff7ab6",best:"JPY pairs, AUDJPY; mark the Asian range"},
+ {k:"london",n:"London",tz:"Europe/London",o:8,c:17,col:"#33d6ff",best:"EUR, GBP, XAUUSD; breakouts of the Asian range"},
+ {k:"ny",n:"New York",tz:"America/New_York",o:8,c:17,col:"#3ddc97",best:"USD pairs, XAUUSD, indices; US news at open"}
+];
+function sessIntervals(s,around){const out=[];const p=tzParts(around,s.tz);for(let k=-2;k<=2;k++){const dow=new Date(Date.UTC(p.y,p.m-1,p.d+k)).getUTCDay();if(dow===0||dow===6)continue;out.push({s,o:zoned(p.y,p.m,p.d+k,s.o,0,s.tz),c:zoned(p.y,p.m,p.d+k,s.c,0,s.tz)})}return out}
+function marketOpen(ts){const p=tzParts(ts,"America/New_York");const dow=new Date(Date.UTC(p.y,p.m-1,p.d)).getUTCDay();const h=p.h+p.mi/60;if(dow===6)return false;if(dow===5&&h>=17)return false;if(dow===0&&h<17)return false;return true}
+function allIntervals(now){return SESS.flatMap(s=>sessIntervals(s,now))}
+function overlaps(now){const L=sessIntervals(SESS[2],now),N=sessIntervals(SESS[3],now),T=sessIntervals(SESS[1],now),o=[];
+ L.forEach(a=>N.forEach(b=>{const s=Math.max(a.o,b.o),e=Math.min(a.c,b.c);if(e>s)o.push({n:"London–New York overlap",o:s,c:e,prime:true})}));
+ T.forEach(a=>L.forEach(b=>{const s=Math.max(a.o,b.o),e=Math.min(a.c,b.c);if(e>s)o.push({n:"Tokyo–London overlap",o:s,c:e})}));return o}
+function nfpNext(now){const res=[];const p=tzParts(now,"America/New_York");for(let k=0;k<3;k++){const y=p.y+Math.floor((p.m-1+k)/12),m=(p.m-1+k)%12+1;let d=1;while(new Date(Date.UTC(y,m-1,d)).getUTCDay()!==5)d++;res.push(zoned(y,m,d,8,30,"America/New_York"))}return res.find(t=>t>now-36e5)}
+function fxStatus(now=Date.now()){
+  const open=marketOpen(now);const iv=allIntervals(now);
+  const active=open?iv.filter(i=>now>=i.o&&now<i.c).map(i=>i.s.n):[];
+  const ov=overlaps(now).find(o=>now>=o.o&&now<o.c);
+  const events=[];iv.forEach(i=>{events.push({t:i.o,kind:i.s.k+"_open",label:i.s.n+" opens"});events.push({t:i.c,kind:i.s.k+"_close",label:i.s.n+" closes"})});
+  overlaps(now).forEach(o=>{if(o.prime)events.push({t:o.o,kind:"overlap",label:"London–NY overlap starts (prime time)"})});
+  const nfp=nfpNext(now);if(nfp)events.push({t:nfp,kind:"nfp",label:"US Non-Farm Payrolls (NFP) release"});
+  const up=events.filter(e=>e.t>now&&marketOpen(e.t+60000)).sort((a,b)=>a.t-b.t);
+  let quality,advice;
+  if(!open){quality="CLOSED";advice="Weekend: the market is closed. Review your journal and plan levels for next week. Expect gaps at the Monday open."}
+  else if(ov&&ov.prime){quality="PRIME";advice="London–New York overlap: highest liquidity and tightest spreads. Best window for XAUUSD and EUR/GBP/USD pairs. Watch for US data releases."}
+  else if(active.includes("London")){quality="GOOD";advice="London session: strong moves on EUR, GBP and gold. Classic window for breakouts of the Asian range."}
+  else if(active.includes("New York")){quality="FAIR";advice="New York afternoon: liquidity is fading after London closes. Manage open trades and avoid fresh entries late in the session."}
+  else if(active.includes("Tokyo")){quality="SLOW";advice="Asian session: ranges are tight on gold and EUR/GBP. Mark the Asian high/low for the London open. JPY/AUD pairs are best now."}
+  else {quality="QUIET";advice="Between sessions: wider spreads and thin liquidity. Not a good time for new entries."}
+  const rollover=(()=>{const p=tzParts(now,"America/New_York");return p.h===16&&p.mi>=45||p.h===17&&p.mi<30})();
+  if(rollover&&open){quality="AVOID";advice="Daily rollover (around 17:00 New York): spreads widen sharply. Don't open trades now."}
+  return{open,active,ov,quality,advice,up,nfp}
+}
+const QCOL={PRIME:"var(--ok)",GOOD:"var(--cy)",FAIR:"var(--gold)",SLOW:"var(--mut)",QUIET:"var(--mut)",AVOID:"var(--bad)",CLOSED:"var(--bad)"};
+function renderSessions(){
+  const now=Date.now(),st=fxStatus(now);
+  $("#fxNow").innerHTML=`<span style="color:${QCOL[st.quality]}">${st.quality}</span> · ${st.active.length?st.active.join(" + ")+" open":"No major session open"}`;
+  $("#fxNowSub").textContent=st.advice;
+  $("#fxNext").innerHTML=st.up.slice(0,4).map(e=>`⏭ <b>${esc(e.label)}</b> at ${fT(e.t)} EAT (${fD(e.t)}) · in ${dur(e.t-now)}`).join("<br>");
+  // timeline
+  let base=now;const wd=t=>{const q=tzParts(t,EAT);return new Date(Date.UTC(q.y,q.m-1,q.d)).getUTCDay()};while(wd(base)===0||wd(base)===6)base+=864e5;
+  const p=tzParts(base,EAT);const ds=zoned(p.y,p.m,p.d,0,0,EAT),de=ds+864e5;const isToday=base===now;
+  $("#fxClockT").textContent=isToday?"Today's market clock (EAT)":"Next trading day: "+fD(ds+6*36e5)+" (EAT)";
+  const rows=SESS.map(s=>({n:s.n,col:s.col,iv:sessIntervals(s,base)}));
+  rows.push({n:"LDN–NY overlap",col:"var(--gold)",iv:overlaps(base).filter(o=>o.prime)});
+  let h=`<div class="hours">${[0,3,6,9,12,15,18,21,24].map(x=>`<span style="left:${x/24*100}%">${String(x).padStart(2,"0")}</span>`).join("")}</div>`;
+  h+=rows.map(r=>`<div class="row2"><span class="lab">${esc(r.n)}</span><div class="bar">${r.iv.filter(i=>i.c>ds&&i.o<de).map(i=>{const a=(Math.max(i.o,ds)-ds)/864e5*100,b=(Math.min(i.c,de)-ds)/864e5*100;return `<i class="band" style="left:${a}%;width:${b-a}%;background:${r.col}" title="${fT(i.o)}–${fT(i.c)} EAT"></i>`}).join("")}</div></div>`).join("");
+  $("#fxTimeline").innerHTML=h+(isToday?`<div class="nowline" style="left:calc(100px + (100% - 100px) * ${(now-ds)/864e5})"></div>`:"");
+  // table
+  const today=SESS.map(s=>{const iv=sessIntervals(s,now).filter(i=>i.c>now-12*36e5).sort((a,b)=>a.o-b.o)[0];const on=st.open&&iv&&now>=iv.o&&now<iv.c;return {s,iv,on}});
+  $("#fxTable").innerHTML=`<table class="tbl"><tr><th>Session</th><th>Opens</th><th>Closes</th><th>Status</th></tr>${today.map(r=>`<tr><td><span class="dot" style="background:${r.s.col}"></span>${r.s.n}</td><td class="mono">${r.iv?fT(r.iv.o):"—"}</td><td class="mono">${r.iv?fT(r.iv.c):"—"}</td><td>${r.on?'<span style="color:var(--ok)">● Open</span>':'<span class="hint">Closed</span>'}</td></tr>`).join("")}</table><p class="hint" style="margin-top:6px">${today.map(r=>`<b>${r.s.n}:</b> ${r.s.best}`).join("<br>")}</p>`;
+  // plan
+  const L=sessIntervals(SESS[2],now).find(i=>i.c>now)||sessIntervals(SESS[2],now).pop();
+  const N=sessIntervals(SESS[3],now).find(i=>i.c>now)||sessIntervals(SESS[3],now).pop();
+  const T=sessIntervals(SESS[1],now).find(i=>i.c>now)||sessIntervals(SESS[1],now).pop();
+  const nyData=N?N.o+30*6e4:null;
+  $("#fxPlan").innerHTML=`<div class="kv">
+   <span>🌙 Asian range forms (Tokyo)</span><b>${fT(T.o)}–${fT(L.o)}</b>
+   <span>📝 Plan: mark Asian high/low, PDH/PDL, check calendar</span><b>before ${fT(L.o-30*6e4)}</b>
+   <span>🇬🇧 London open: breakout window</span><b>${fT(L.o)}–${fT(L.o+2*36e5)}</b>
+   <span>🇺🇸 US data usually lands (08:30 NY)</span><b>${fT(nyData)}</b>
+   <span>🔥 PRIME: London–NY overlap (gold!)</span><b>${fT(N.o)}–${fT(L.c)}</b>
+   <span>🏁 London close: take profits / trail stops</span><b>${fT(L.c)}</b>
+   <span>⛔ No new entries after</span><b>${fT(N.c-3*36e5)}</b>
+   <span>⚠️ Rollover: spreads widen</span><b>${fT(N.c-15*6e4)}–${fT(N.c+30*6e4)}</b></div>
+   <p class="hint" style="margin-top:8px">Times update automatically when London or New York change their clocks for daylight saving.</p>`;
+  // news
+  const nfp=st.nfp;
+  $("#fxNews").innerHTML=`<div class="kv">
+   <span>Next NFP (first Friday, 08:30 New York)</span><b>${nfp?fD(nfp)+" "+fT(nfp)+" EAT":"—"}</b>
+   <span>US CPI, retail sales, jobless claims (usually 08:30 NY)</span><b>${fT(nyData)} EAT</b>
+   <span>FOMC rate decision (14:00 NY, about 8×/year)</span><b>${fT(zoned(tzParts(now,"America/New_York").y,tzParts(now,"America/New_York").m,tzParts(now,"America/New_York").d,14,0,"America/New_York"))} EAT</b></div>
+   <div class="warn">Rule from your saves and the research: <b>no new trades 30 min before or 15 min after high-impact (red) news.</b> If you trade news, wait for the first 15-minute candle to close and trade the retest. Spreads and slippage spike at the release.</div>`;
+}
+/* alerts */
+const AL_KINDS=[["london_open","🇬🇧 London open"],["overlap","🔥 London–NY overlap"],["ny_open","🇺🇸 New York open"],["tokyo_open","🇯🇵 Tokyo open (mark Asian range)"],["nfp","📰 NFP release"],["london_close","🏁 London close"]];
+let alOn={};try{alOn=JSON.parse(localStorage.getItem("jv_al")||'{"london_open":1,"overlap":1,"nfp":1}')}catch(e){alOn={london_open:1,overlap:1,nfp:1}}
+const fired=new Set();
+$("#fxAlerts").innerHTML=AL_KINDS.map(([k,n])=>`<label class="row" style="gap:8px;font-size:13.5px"><input type="checkbox" data-al="${k}" ${alOn[k]?"checked":""} style="width:auto"> ${n}</label>`).join("");
+$("#fxAlerts").onchange=e=>{const k=e.target.dataset.al;if(!k)return;alOn[k]=e.target.checked?1:0;try{localStorage.setItem("jv_al",JSON.stringify(alOn))}catch(_){}};
+let actx=null;function beep(){try{actx=actx||new AudioContext();const o=actx.createOscillator(),g=actx.createGain();o.frequency.value=880;g.gain.value=.08;o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+.25)}catch(e){}}
+function checkAlerts(){const now=Date.now(),lead=+$("#fxLead").value*6e4;fxStatus(now).up.forEach(e=>{if(!alOn[e.kind])return;const key=e.kind+e.t;if(fired.has(key))return;if(now>=e.t-lead&&now<e.t){fired.add(key);const msg=`${e.label} in ${Math.round((e.t-now)/6e4)} minutes (${fT(e.t)} EAT).`;toast("🔔 "+msg);beep();if(window.jmNotify)window.jmNotify("Jarmoo forex alert",msg);addMsg("j","🔔 Forex alert: "+msg+(e.kind==="nfp"?" No new trades 30 min before, Sir.":""));say("Forex alert. "+msg)}})}
+setInterval(()=>{if($("#m-forex").classList.contains("on"))renderSessions();checkAlerts()},20000);
+
+/* risk calc */
+const SYMS=[["EURUSD","usdq"],["GBPUSD","usdq"],["AUDUSD","usdq"],["NZDUSD","usdq"],["XAUUSD (Gold)","xau"],["USDJPY","usdjpy"],["USDCAD","usdbase"],["USDCHF","usdbase"],["EURJPY","jpyx"],["GBPJPY","jpyx"],["AUDJPY","jpyx"],["US30 / NAS100 / US500","index"],["Other (custom pip value)","custom"]];
+$("#rSym").innerHTML=SYMS.map(([n,t],i)=>`<option value="${i}">${n}</option>`).join("");
+function rType(){return SYMS[+$("#rSym").value][1]}
+function calcRisk(){
+  const t=rType();
+  $("#rRateL").style.display=t==="jpyx"?"":"none";$("#rContL").style.display=(t==="xau"||t==="index"||t==="custom")?"":"none";
+  $("#rContL").firstChild.textContent=t==="custom"?"Pip value per 1 lot (USD)":t==="index"?"USD per 1 point per lot":"Contract size per lot (oz)";
+  if(t==="index"&&$("#rCont").dataset.t!=="index"){$("#rCont").value=1}if(t==="xau"&&$("#rCont").dataset.t!=="xau"){$("#rCont").value=100}if(t==="custom"&&$("#rCont").dataset.t!=="custom"){$("#rCont").value=10}$("#rCont").dataset.t=t;
+  $("#rPipsL").firstChild.textContent=(t==="xau"?"…or stop distance in $ (price)":t==="index"?"…or stop in points":"…or stop in pips");
+  const bal=+$("#rBal").value,pct=+$("#rPct").value,dir=+$("#rDir").value,en=parseFloat($("#rEntry").value),sl=parseFloat($("#rStop").value),cont=+$("#rCont").value,tz=+$("#rTzs").value,lev=+$("#rLev").value,daily=+$("#rDaily").value;
+  const pipSize=t==="usdjpy"||t==="jpyx"?0.01:(t==="xau"||t==="index")?1:0.0001;
+  let dist=(!isNaN(en)&&!isNaN(sl))?Math.abs(en-sl)/pipSize:parseFloat($("#rPips").value);
+  let pv;// USD per pip per lot
+  if(t==="usdq")pv=10;else if(t==="usdjpy")pv=!isNaN(en)?1000/en:NaN;else if(t==="usdbase")pv=!isNaN(en)?10/en:NaN;else if(t==="jpyx")pv=+$("#rRate").value?1000/+$("#rRate").value:NaN;else if(t==="xau")pv=cont;else if(t==="index")pv=cont;else pv=cont;
+  const out=$("#rOut");
+  if(!(bal>0&&pct>0&&dist>0)){out.innerHTML=`<p class="hint">Enter balance, risk % and a stop (entry + stop price, or a distance).</p>`;return null}
+  if(!(pv>0)){out.innerHTML=`<p class="hint">${t==="jpyx"?"Enter the current USDJPY rate.":"Enter the entry price so Jarmoo can value each pip."}</p>`;return null}
+  const riskUsd=bal*pct/100,rawLots=riskUsd/(dist*pv),lots=Math.floor(rawLots*100)/100,actual=lots*dist*pv;
+  const unit=t==="xau"?"$ price":t==="index"?"points":"pips";
+  const tp=(r)=>!isNaN(en)?(en+dir*r*dist*pipSize).toFixed(t==="usdq"||t==="usdbase"?5:t==="xau"||t==="index"?2:3):"—";
+  let margin="";if(lev>0&&!isNaN(en)){const notional=t==="usdq"?lots*1e5*en:t==="usdbase"||t==="usdjpy"?lots*1e5:t==="xau"?lots*cont*en:t==="jpyx"?NaN:NaN;if(notional>0)margin=`<span>Margin needed (1:${lev})</span><b>$${(notional/lev).toFixed(2)}</b>`}
+  const warn=[];if(pct>2)warn.push("Risk above 2% per trade is aggressive. Most pros use 0.5–1%.");if(lots<0.01)warn.push("Stop too wide for this balance: even 0.01 lots risks more than your limit. Use a tighter structure stop or skip the trade.");if(t==="xau"&&dist<2)warn.push("A gold stop under $2 often gets hit by noise. Consider $3–8 with a smaller lot.");
+  const lossesToDaily=Math.max(1,Math.floor(daily/pct));
+  out.innerHTML=`<div class="big">${lots<0.01?"0.00":lots.toFixed(2)} lots</div><p class="hint">Raw ${rawLots.toFixed(3)} lots, rounded down for safety</p>
+   <div class="kv" style="margin-top:10px">
+   <span>Money at risk</span><b>$${actual.toFixed(2)}${tz?` · TSh ${Math.round(actual*tz).toLocaleString()}`:""}</b>
+   <span>Risk % of account</span><b>${(actual/bal*100).toFixed(2)}%</b>
+   <span>Stop distance</span><b>${dist.toFixed(1)} ${unit}</b>
+   <span>Value per ${t==="xau"?"$1":t==="index"?"point":"pip"} (this size)</span><b>$${(lots*pv).toFixed(2)}</b>
+   <span>TP1 · 1:2 (+${(actual*2).toFixed(2)} $)</span><b>${tp(2)}</b>
+   <span>TP2 · 1:3 (+${(actual*3).toFixed(2)} $)</span><b>${tp(3)}</b>
+   <span>Break-even after</span><b>+1R → move SL to entry</b>
+   <span>Daily stop (${daily}%)</span><b>$${(bal*daily/100).toFixed(2)} ≈ ${lossesToDaily} losses</b>
+   <span>Win rate needed at 1:2</span><b>34%</b>${margin}</div>
+   ${warn.map(w=>`<div class="warn">${w}</div>`).join("")}`;
+  window._risk={sym:SYMS[+$("#rSym").value][0],lots,actual,dist,unit,dir,en,sl,tp1:tp(2),tp2:tp(3),pct};
+  renderCheck();return window._risk;
+}
+["rBal","rPct","rSym","rDir","rEntry","rStop","rPips","rRate","rCont","rTzs","rLev","rDaily"].forEach(id=>{$("#"+id).addEventListener("input",calcRisk)});
+$("#rDD").innerHTML=[[10,11.1],[20,25],[30,42.9],[50,100],[70,233]].map(([l,g])=>`<div class="stat"><b style="color:var(--bad)">−${l}%</b><span>needs <b style="color:var(--ok)">+${g}%</b> to get back</span></div>`).join("")+`<div class="stat"><b style="font-size:16px">1% risk</b><span>10 losses in a row ≈ −9.6%. At 5% risk the same streak ≈ −40%.</span></div>`;
+
+/* setup checker */
+const CK=[
+ {k:"htf",w:20,t:"Higher-timeframe trend agrees",d:"D1/H4: price on the right side of the EMA 200, and EMA 50 above it for buys (below for sells)."},
+ {k:"lvl",w:15,t:"Price is at a key level",d:"Support/resistance, PDH/PDL, Asian high/low, round number, order block/FVG, or volume-profile VAH/VAL/POC."},
+ {k:"conf",w:15,t:"Confirmation candle / break & retest",d:"Engulfing, pin bar or CHoCH on the entry timeframe. No FOMO on the first big breakout candle (bull-trap post)."},
+ {k:"sess",w:10,t:"Good session (auto)",d:"London, New York or the overlap. Not the Asian chop for gold, not rollover."},
+ {k:"news",w:15,t:"No red news within 30 minutes",d:"Checked Forex Factory: no NFP, CPI, FOMC or rate decision coming up."},
+ {k:"rr",w:10,t:"Reward ≥ 2× risk",d:"The target sits at the next level with at least 1:2 room."},
+ {k:"sl",w:5,t:"Stop is beyond structure (not at a round number)",d:"ATR-based or past the swing, a few pips beyond 00/50 levels (Osler)."},
+ {k:"mind",w:10,t:"Within limits and calm",d:"Daily loss limit not hit, not revenge trading, same lot discipline as always."}
+];
+let ckState={};
+$("#ckList").innerHTML=CK.map(c=>`<label class="ck"><input type="checkbox" data-ck="${c.k}"><span><b>${c.t}</b> <span class="hint">(+${c.w})</span><small>${c.d}</small></span></label>`).join("");
+$("#ckList").onchange=e=>{const k=e.target.dataset.ck;if(k){ckState[k]=e.target.checked;renderCheck()}};
+function renderCheck(){
+  const st=fxStatus();const sessOk=["PRIME","GOOD"].includes(st.quality);
+  const sb=document.querySelector('[data-ck="sess"]');if(sb){sb.checked=sessOk;ckState.sess=sessOk;sb.disabled=true}
+  const score=CK.reduce((a,c)=>a+(ckState[c.k]?c.w:0),0);
+  const must=ckState.news&&ckState.mind;
+  let g,col,act,riskMult;
+  if(!st.open){g="—";col="var(--mut)";act="The market is closed (weekend). Use this checklist to rehearse your plan for Monday.";riskMult=0}
+  else if(!must){g="NO";col="var(--bad)";act="No trade. News is close or you are outside your limits. Protecting capital is the trade.";riskMult=0}
+  else if(score>=85){g="A+";col="var(--ok)";act="Valid A+ setup. Take it with your full planned risk.";riskMult=1}
+  else if(score>=70){g="B";col="var(--gold)";act="Acceptable, but not perfect. Take it with half your normal risk.";riskMult=.5}
+  else {g="C";col="var(--bad)";act="Skip it. Wait for price to come to your level or for confirmation.";riskMult=0}
+  const r=window._risk;
+  $("#ckOut").innerHTML=`<div class="row"><span class="grade" style="color:${col}">${g}</span><div><b>${score}/100</b><p class="hint" style="margin:0">Session now: ${st.quality}</p></div></div><p style="margin-top:10px">${act}</p>
+   ${r&&riskMult?`<div class="kv" style="margin-top:10px"><span>Instrument</span><b>${esc(r.sym)} ${r.dir>0?"BUY":"SELL"}</b><span>Lot size</span><b>${(Math.floor(r.lots*riskMult*100)/100).toFixed(2)}</b><span>Entry</span><b>${isNaN(r.en)?"—":r.en}</b><span>Stop-loss</span><b>${isNaN(r.sl)?r.dist.toFixed(1)+" "+r.unit:r.sl}</b><span>TP1 (1:2) close 50%</span><b>${r.tp1}</b><span>TP2 (1:3) runner</span><b>${r.tp2}</b><span>Manage</span><b>SL → entry at +1R</b></div>`:`<p class="hint" style="margin-top:8px">Fill in the Risk Calculator tab and Jarmoo will add the exact lot, stop and targets here.</p>`}`;
+}
+
+/* AI chart */
+$("#aiGo").onclick=async()=>{
+  const files=[...$("#aiImg").files];const out=$("#aiOut");
+  if(!sample){out.innerHTML=`<p class="hint">The AI brain isn't available in this view.</p>`;return}
+  if(!files.length){toast("Add a chart screenshot first");return}
+  let lim=null;try{lim=await sample.limits()}catch(e){}
+  if(lim&&!lim.images){out.innerHTML=`<p class="hint">Image analysis isn't enabled here. Describe the chart in the Console instead.</p>`;return}
+  const st=fxStatus();const r=window._risk;
+  out.innerHTML=`<p class="hint">Jarmoo is reading your chart…</p>`;
+  const prompt=`You are a disciplined professional forex/gold trading coach analysing a chart screenshot for Moses (Tanzania, EAT time). Pair/timeframe: ${$("#aiPair").value||"unknown, read it from the image"}. His question: ${$("#aiQ").value||"none"}. Current session status: ${st.quality} (${st.active.join(", ")||"no session"}). ${r?`His risk settings: ${r.pct}% per trade, calculator lot ${r.lots}.`:""}
+Analyse ONLY what is visible. Identify trend/market structure (HH/HL or LH/LL, BOS/CHoCH), key support/resistance and liquidity levels, any setup (break & retest, liquidity sweep, range, pattern). Give a conditional plan, not a prediction. If there is no clean setup, say WAIT and say what would make it valid.
+Return ONLY JSON: {"pair":"","timeframe":"","bias":"bullish|bearish|neutral","structure":"1-2 sentences","levels":["..."],"setup":"name or none","action":"BUY|SELL|WAIT","entry":"price or condition","stop":"price + reason","tp1":"","tp2":"","rr":"","invalidation":"","confidence":"low|medium|high","wait_for":"what confirmation to wait for","risk_note":"1 sentence"}`;
+  try{
+    const res=await sample(prompt,{images:files,modelTier:"complex",cache:false});
+    let j;try{j=JSON.parse(res.text.slice(res.text.indexOf("{"),res.text.lastIndexOf("}")+1))}catch(e){out.innerHTML=`<div class="card">${md(res.text)}</div>`;return}
+    const ac=j.action==="BUY"?"var(--ok)":j.action==="SELL"?"var(--bad)":"var(--gold)";
+    out.innerHTML=`<div class="card"><div class="row"><span class="grade" style="color:${ac};font-size:34px">${esc(j.action||"")}</span><div><b>${esc(j.pair||"")} ${esc(j.timeframe||"")}</b> · bias ${esc(j.bias||"")} · confidence ${esc(j.confidence||"")}<p class="hint" style="margin:0">${esc(j.setup||"")}</p></div></div>
+     <p style="margin-top:10px">${esc(j.structure||"")}</p>
+     <div class="kv" style="margin-top:8px"><span>Entry</span><b>${esc(j.entry||"—")}</b><span>Stop-loss</span><b>${esc(j.stop||"—")}</b><span>TP1</span><b>${esc(j.tp1||"—")}</b><span>TP2</span><b>${esc(j.tp2||"—")}</b><span>R:R</span><b>${esc(j.rr||"—")}</b><span>Invalidation</span><b>${esc(j.invalidation||"—")}</b></div>
+     <p style="margin-top:8px"><b>Key levels:</b> ${(j.levels||[]).map(esc).join(" · ")}</p><p><b>Wait for:</b> ${esc(j.wait_for||"")}</p>
+     <div class="warn">${esc(j.risk_note||"")} Put the entry and stop into the Risk Calculator to get your exact lot size. This is educational analysis, not a guaranteed signal.</div></div>`;
+    say(`${j.action}. ${j.structure||""}`);
+  }catch(e){out.innerHTML=`<p class="hint">${e&&e.code==="rate_limited"?"Rate limited. Try again in a minute.":"Couldn't analyse the image right now."}</p>`}
+};
+
+/* playbook */
+const PLAY=[
+ {n:"Daily Trend Rider (EMA 50/200 + Donchian)",ev:"s",evt:"Strong evidence",tf:"D1 / H4 · any session · majors + XAUUSD",src:"Research: Moskowitz-Ooi-Pedersen 2012, Hurst-Ooi-Pedersen 2017, Turtle rules",
+  r:["<b>Filter:</b> long only when price > EMA200 and EMA50 > EMA200 (short = opposite).","<b>Entry:</b> daily close above the 20-day high (short: below the 20-day low), or a pullback to EMA50 with a bullish close.","<b>Stop:</b> 2–3 × ATR(20) from entry, or beyond the last swing.","<b>Exit:</b> trail 3×ATR, or close on the opposite 10-day extreme. No fixed TP: winners pay for everything.","<b>Risk:</b> 0.5–1% per trade. Expect a 30–45% win rate and long flat periods."]},
+ {n:"PDH / PDL Break & Retest",ev:"w",evt:"Untested: demo first",tf:"Mark on H1, execute M5 · London or NY open",src:"Your save: @jdub_trades 'Simple day trading strategy'",
+  r:["Mark the <b>previous day high/low</b> (PDH/PDL) as liquidity targets.","On M5, mark the pre-session high/low (the Asian range before London, or the pre-NY range).","Wait for a <b>break</b> of one side, then a <b>retest</b> that holds.","Enter on a confirmation candle. Stop beyond the retest swing.","Target PDH/PDL, then 1:2. Skip if red news is within 30 minutes."]},
+ {n:"London Breakout (Asian range)",ev:"w",evt:"Folklore: cost-sensitive",tf:"M15 · EURUSD, GBPUSD, GBPJPY, XAUUSD",src:"Research §2.5; your time-of-day saves (@gs_business_academy, @curie_trades)",
+  r:["Asian range = high/low from 00:00–07:00 GMT (EAT: 03:00–10:00 in winter).","At the London open, place a buy-stop and sell-stop a few pips beyond the range.","Stop on the other side or at the middle of the range. Target 1–2 × the range height.","Skip it if the range is wider than average or news is due. Close everything by London close.","Costs eat this strategy: use tight-spread pairs only and log every trade."]},
+ {n:"Support / Resistance & Round Numbers",ev:"m",evt:"Moderate (reactions only)",tf:"H1–H4 levels, M15 entries",src:"Osler (NY Fed): published S/R stopped trends 60.8% vs 56.2% random · @lukedavis.ig",
+  r:["Draw levels where price reversed several times. Round numbers (00/50) act as magnets.","<b>Buy</b> at support or <b>sell</b> at resistance only after a rejection candle (pin bar or engulfing).","Place your stop a few pips <b>beyond</b> the round number, not on it: stop orders cluster there and get hunted.","TP at the next level. If a level breaks cleanly, it often flips (support becomes resistance)."]},
+ {n:"Volume Profile Entry",ev:"w",evt:"Weak evidence",tf:"Session / fixed-range profile",src:"Your saves: @conrad_blaire, @neo.wilder 'BEST ENTRY using Volume Profile'",
+  r:["Plot the profile and mark the <b>POC</b> (most traded price), <b>VAH</b> and <b>VAL</b> (value area).","Rejection at VAH/VAL back into value → trade toward the POC.","Acceptance outside value (2+ candles closing outside) → trade the breakout in that direction.","Stop beyond the rejection wick. Best on gold and indices."]},
+ {n:"SMC: Liquidity Sweep → CHoCH → FVG/OB",ev:"w",evt:"No peer-reviewed support",tf:"H4 bias, M15/M5 entry",src:"Your saves: @rohitfxtrades 30-day plan (BOS, CHoCH, OB, FVG), @smartmoneybrand",
+  r:["H4 bias: bullish (higher highs/lows) or bearish.","Wait for price to <b>sweep liquidity</b> (take out an obvious high/low, e.g. the Asian low).","On M15/M5 look for a <b>CHoCH</b> (change of character) back in the bias direction.","Enter on the retrace into the <b>FVG</b> or <b>order block</b> left by that move. Stop beyond the sweep wick.","Target the opposite liquidity pool, at least 1:2. Rule-test it strictly: vague SMC rules usually fail."]},
+ {n:"Candle Confirmations & Traps",ev:"m",evt:"Use only as confirmation",tf:"Any",src:"Your saves: @smart.forexpips (hanging man), @galatrades (1-2-3 candles), @dailysimplestock (bull trap), @eyevorytowermedia",
+  r:["<b>Hanging man</b> after an uptrend = possible top, but only valid if the next candle closes lower.","<b>1-2-3 pattern:</b> impulse, inside/pause candle, then a break of candle 2 in the trend direction.","<b>Bull trap:</b> never buy the first giant breakout candle. Wait for the retest or you buy the top.","Candles matter only at key levels in the trend direction. On their own they are noise."]},
+ {n:"Gold (XAUUSD) Playbook",ev:"m",evt:"Practical rules",tf:"H1 bias, M15 entries",src:"Your saves: @curie_trades 'When not to trade Gold', @forextradingdecoded, @elizfxacademy · TMGM/brokers session data",
+  r:["<b>Best window:</b> London–NY overlap (13:00–17:00 GMT = <b>16:00–20:00 EAT</b> in winter, 15:00–19:00 in summer).","<b>Avoid:</b> the Asian session chop, 30 min around NFP/CPI/FOMC, Friday after 21:00 EAT, and rollover.","Gold moves $10–40 a day: use wider stops ($3–8) and <b>smaller lots</b>. The calculator handles the maths.","Gold reacts to the USD and US yields: a strong dollar or rising yields usually means weaker gold."]},
+ {n:"News Trading (NFP / CPI)",ev:"w",evt:"Pros only",tf:"M5–M15",src:"Your save: @forex_genius_faar (analysis 10 min before news) · Andersen et al. 2003",
+  r:["Default: <b>be flat</b> 30 min before red news.","If you must trade it: don't straddle the release. Wait for the first 15-minute candle to close.","Trade the <b>retest</b> of that candle's high/low in the direction of the break. Half your normal risk.","Expect slippage and spreads 5–10× normal. Prop firms often ban news trades."]},
+ {n:"Bots, AI Traders & Copy Trading",ev:"w",evt:"Treat claims with care",tf:"—",src:"Your saves: Grok '$125 → $3,875', Claude 'Trader skill', @tatelalk bots, @johnsonfxpro copy trading",
+  r:["Viral bot profits are marketing. Ask for 6+ months of verified Myfxbook results with max drawdown.","<b>Never run martingale or grid EAs</b>: about 89% blow up within 1,000 trades (your research report).","Your bot blueprint: D1 trend system, 0.5% risk, kill-switch, 3–6 months on demo first.","Avoid 'account managers' who take your login. Copy trading is only acceptable on regulated platforms with visible history."]}
+];
+$("#playList").innerHTML=PLAY.map(p=>`<div class="card pl"><h3><span>${esc(p.n)}</span><span class="ev ${p.ev}">${p.evt}</span></h3><p class="hint">${esc(p.tf)}</p><ul>${p.r.map(x=>`<li>${x}</li>`).join("")}</ul><p class="hint" style="margin-top:8px">📌 ${esc(p.src)}</p></div>`).join("");
+$("#jSetup").innerHTML=PLAY.map(p=>`<option>${esc(p.n.split(" (")[0])}</option>`).join("")+"<option>Other</option>";
+
+/* safety & rules */
+const SAFE=[
+ {t:"Your 10 risk commandments",b:["Risk <b>0.5–1%</b> per trade (0.5% on new strategies). Never above 2%.","Daily stop <b>−3%</b> (or 3 losses), then close the platform. Weekly stop −6%.","Max open risk across all trades: 4%. Gold and USD pairs count as one bucket.","Same lot size every time. Don't size up after two wins (@ahmedtrading).","Hit your daily target? <b>Out of the market.</b>","Always set a hard stop-loss at the broker. Never move it further away.","At +1R, move the stop to break-even. Take 50% at 1:2 and run the rest.","After a 10% drawdown, halve your risk. At 20%, stop and review.","Journal every trade, including emotions.","No trades 30 min before red news, at rollover, or when angry."]},
+ {t:"Lot discipline (from your saves)",b:["@ahmedtrading: $1K–$10K accounts → <b>never above 0.03 lots</b>. $100K → never above 0.20.","@trader_gautam11: lot size must follow capital. Use the Risk Calculator, not feelings.","Boring risk management beats brave sizing: one wrong big trade wipes out months."]},
+ {t:"Trader roadmap (@elizfxacademy)",b:["<b>1. Market analysis:</b> structure (trend/range), key levels, price action.","<b>2. Risk management:</b> position sizing, exit plan, loss limits.","<b>3. Psychology:</b> fear and greed, discipline, patience.","<b>4. Process:</b> strategy rules, backtest + forward test, journal review."]},
+ {t:"Is forex just betting? (@jifunze.quran.islam)",b:["Without a tested edge and risk control it <b>behaves like betting</b>: the house (spread) wins over time.","With a tested system, fixed risk and a journal, it is speculation, not a guarantee.","Reality check: 70–89% of retail CFD accounts lose money (ESMA/IG). Prop-firm payouts reach only about 1–7% of traders.","@intelligencefx: 'Stop trading randomly. Start trading with a system.'"]},
+ {t:"Tanzania: stay safe",b:["No Tanzanian licence exists for retail online forex brokers. BoT has said it is studying the activity (Dec 2024).","Use brokers regulated by <b>FCA, ASIC or CySEC</b>, and check the regulator's register yourself.","🚩 Scams: 'account managers', guaranteed-profit signal groups, Telegram 'VIP' channels, recovery agents.","Profits may be taxable. Get advice from a TRA-registered tax adviser."]},
+ {t:"Real signals & notifications",b:["Jarmoo can't see live prices inside this page. For price triggers use <b>TradingView alerts</b> (push to your phone) or <b>MT5 mobile alerts</b> at your levels.","Workflow: mark levels here, set alerts there, and when an alert fires come back for the Checklist and Calculator.","Session alerts in this tab speak and beep while the page is open.","A daily Jarmoo Forex Briefing can arrive on your phone before London opens (see your scheduled tasks)."]},
+ {t:"Apps that pros use (@invest_tech7886, @marekexplains)",b:["<b>MetaTrader 5</b>: execution, alerts, EAs.","<b>TradingView</b>: charts, alerts, volume profile.","<b>Forex Factory / Investing.com</b>: economic calendar.","<b>Myfxbook</b>: verify any 'profitable' trader or bot."]}
+];
+$("#safeList").innerHTML=SAFE.map(s=>`<div class="card pl"><h3>${esc(s.t)}</h3><ul>${s.b.map(x=>`<li>${x}</li>`).join("")}</ul></div>`).join("");
+
+/* journal */
+let TRADES=[],tradesCol=null;
+function localTrades(){try{return JSON.parse(localStorage.getItem("jv_trades")||"[]")}catch(e){return[]}}
+function saveTradesLocal(){try{localStorage.setItem("jv_trades",JSON.stringify(TRADES))}catch(e){}}
+function renderJournal(){
+  const L=[...TRADES].sort((a,b)=>b.ts-a.ts);const n=L.length;
+  const wins=L.filter(t=>t.r>0).length,totR=L.reduce((a,t)=>a+(+t.r||0),0),avgW=wins?L.filter(t=>t.r>0).reduce((a,t)=>a+t.r,0)/wins:0,loss=L.filter(t=>t.r<0),avgL=loss.length?loss.reduce((a,t)=>a+t.r,0)/loss.length:0;
+  const today=tzParts(Date.now(),EAT);const todayR=L.filter(t=>{const p=tzParts(t.ts,EAT);return p.d===today.d&&p.m===today.m&&p.y===today.y}).reduce((a,t)=>a+(+t.r||0),0);
+  let peak=0,cum=0,dd=0;[...L].reverse().forEach(t=>{cum+=+t.r||0;peak=Math.max(peak,cum);dd=Math.min(dd,cum-peak)});
+  const bySetup={};L.forEach(t=>{bySetup[t.setup]=(bySetup[t.setup]||0)+(+t.r||0)});
+  $("#jStats").innerHTML=n?`<div class="kv"><span>Trades</span><b>${n}</b><span>Win rate</span><b>${(wins/n*100).toFixed(0)}%</b><span>Total</span><b style="color:${totR>=0?"var(--ok)":"var(--bad)"}">${totR.toFixed(1)}R</b><span>Expectancy</span><b>${(totR/n).toFixed(2)}R / trade</b><span>Avg win / loss</span><b>${avgW.toFixed(2)}R / ${avgL.toFixed(2)}R</b><span>Max drawdown</span><b>${dd.toFixed(1)}R</b><span>Today</span><b style="color:${todayR<=-3?"var(--bad)":"var(--txt)"}">${todayR.toFixed(1)}R</b></div>
+   ${todayR<=-3?`<div class="warn">⛔ Daily stop hit (−3R). Jarmoo says: close the platform for today, Sir.</div>`:""}
+   <p class="hint" style="margin-top:8px"><b>Best setup:</b> ${Object.entries(bySetup).sort((a,b)=>b[1]-a[1]).slice(0,1).map(([k,v])=>`${esc(k)} (${v.toFixed(1)}R)`).join("")||"—"}</p>`:`<p class="hint">Log trades to see your win rate, expectancy and best setup.</p>`;
+  $("#jList").innerHTML=n?`<table class="tbl"><tr><th>Date</th><th>Pair</th><th>Dir</th><th>Setup</th><th>R</th><th>Notes</th><th></th></tr>${L.map(t=>`<tr><td class="mono">${fD(t.ts)}</td><td>${esc(t.pair)}</td><td>${esc(t.dir)}</td><td>${esc(t.setup)}</td><td style="color:${t.r>0?"var(--ok)":"var(--bad)"}">${(+t.r).toFixed(1)}</td><td>${esc(t.note||"")}</td><td><button class="copy" style="position:static" data-del="${t.id}">✕</button></td></tr>`).join("")}</table>`:`<p class="hint">No trades yet.</p>`;
+}
+$("#jForm").onsubmit=async e=>{e.preventDefault();const t={id:"t"+Date.now(),ts:Date.now(),pair:$("#jPair").value.toUpperCase(),dir:$("#jDir").value,setup:$("#jSetup").value,risk:+$("#jRisk").value,r:+$("#jR").value,pl:+$("#jPL").value||0,note:$("#jNote").value};TRADES.push(t);renderJournal();$("#jR").value="";$("#jPL").value="";$("#jNote").value="";if(tradesCol){try{await tradesCol.doc(t.id).set(t)}catch(_){saveTradesLocal()}}else saveTradesLocal();toast("Trade logged")};
+$("#jList").onclick=async e=>{const id=e.target.dataset&&e.target.dataset.del;if(!id)return;TRADES=TRADES.filter(t=>t.id!==id);renderJournal();if(tradesCol){try{await tradesCol.doc(id).delete()}catch(_){}}else saveTradesLocal()};
+TRADES=localTrades();renderJournal();
+
+/* tabs */
+const FXT=[["sessions","🕒 Sessions & Alerts"],["risk","🧮 Risk Calculator"],["check","✅ Entry Checklist"],["ai","🤖 AI Chart Analyst"],["play","📘 Strategy Playbook"],["journal","📓 Journal"],["saves","📌 Your Forex Saves"],["safety","🛡 Rules & Safety"]];
+let fxTab="sessions";
+function openFx(t){fxTab=t;$("#fxTabs").innerHTML=FXT.map(([k,n])=>`<button class="chip ${k===t?"on":""}" data-fx="${k}">${n}</button>`).join("");document.querySelectorAll(".fxp").forEach(p=>p.classList.toggle("on",p.id==="fx-"+t));if(t==="sessions")renderSessions();if(t==="check")renderCheck();if(t==="saves")renderFxSaves()}
+$("#fxTabs").onclick=e=>{const b=e.target.closest("[data-fx]");if(b)openFx(b.dataset.fx)};
+openFx("sessions");
+
+/* ================= VAULT ================= */
+let VAULT=null,vCol=-1;
+async function loadVault(){if(VAULT)return VAULT;try{const r=await fetch("vault.json");VAULT=await r.json();VAULT.items.forEach(i=>i.l=(i[3]+" "+i[1]).toLowerCase());$("#vCount").textContent=VAULT.items.length.toLocaleString();renderVaultCols();$("#vAskCol").innerHTML='<option value="">All collections</option>'+VAULT.cols.map((c,i)=>`<option value="${i}">${esc(c[1])} (${c[2]})</option>`).join("");renderVault();renderFxSaves();}catch(e){$("#vList").innerHTML=`<p class="hint">Couldn't load the vault file.</p>`}return VAULT}
+function postHtml(it){const c=VAULT.cols[it[0]];return `<div class="post"><div class="meta"><span class="tag">${esc(c[1])}</span>@${esc(it[1])} · <a href="https://www.instagram.com/p/${esc(it[2])}/" target="_blank" rel="noopener">open ↗</a></div><p>${esc(it[3]||"(video only, no caption)")}</p></div>`}
+function vaultSearch(q,col=-1,limit=40){if(!VAULT)return[];const w=q.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(x=>x.length>2);let L=VAULT.items.filter(i=>col<0||i[0]===col);if(w.length){L=L.map(i=>[i,w.reduce((a,x)=>a+(i.l.includes(x)?1:0),0)]).filter(x=>x[1]>0).sort((a,b)=>b[1]-a[1]).map(x=>x[0])}return L.slice(0,limit)}
+function renderVaultCols(){$("#vCols").innerHTML=`<button class="chip ${vCol<0?"on":""}" data-vc="-1">All</button>`+VAULT.cols.map((c,i)=>`<button class="chip ${vCol===i?"on":""}" data-vc="${i}">${esc(c[1])} · ${c[2]}</button>`).join("")}
+function renderVault(){const q=$("#vQ").value;const L=vaultSearch(q,vCol,q?80:60);$("#vList").innerHTML=`<div class="card">${L.map(postHtml).join("")||'<p class="hint">Nothing found.</p>'}</div>${(!q&&vCol>=0&&VAULT.cols[vCol][2]>60)?'<p class="hint">Showing 60. Search to find more.</p>':""}`}
+$("#vCols").onclick=e=>{const b=e.target.closest("[data-vc]");if(b){vCol=+b.dataset.vc;renderVaultCols();renderVault()}};
+$("#vQ").oninput=()=>renderVault();
+function renderFxSaves(){if(!VAULT){loadVault();return}const fi=VAULT.cols.findIndex(c=>c[0]==="forex-trick-and-online-money");const L=vaultSearch($("#fsQ").value,fi,200);$("#fsList").innerHTML=`<div class="card">${L.map(postHtml).join("")}</div>`}
+$("#fsQ").oninput=renderFxSaves;
+const VQUICK=[["health-and-lesson","Summarize the 10 most useful health lessons I saved, with practical daily actions."],["knowledge","What are the most valuable knowledge nuggets in my saves? Group them by theme."],["opportunity-room","List the online income opportunities I saved, ranked by how realistic they are for me."],["business-idea","Which business ideas from my saves fit a finance professional in Dar es Salaam? Rank the top 5."],["financials-skills","Turn my financial-skills saves into a 4-week learning plan."],["love-section","What relationship lessons appear most often in my love-section saves?"]];
+$("#vQuick").innerHTML=VQUICK.map(([c,q])=>`<button data-c="${c}" data-q="${esc(q)}">${esc(q.split(/[,.]/)[0])}</button>`).join("");
+$("#vQuick").onclick=e=>{const b=e.target.closest("button");if(!b||!VAULT)return;const i=VAULT.cols.findIndex(c=>c[0]===b.dataset.c);$("#vAskCol").value=i;$("#vAsk").value=b.dataset.q;askVault()};
+async function askVault(){
+  await loadVault();const q=$("#vAsk").value.trim();if(!q)return;const ci=$("#vAskCol").value===""?-1:+$("#vAskCol").value;const out=$("#vAns");
+  let pool=ci>=0?VAULT.items.filter(i=>i[0]===ci):vaultSearch(q,-1,120);if(ci>=0){const s=vaultSearch(q,ci,400);if(s.length>20)pool=s.concat(pool.filter(x=>!s.includes(x)))}
+  let ctx="",n=0;for(const it of pool){if(!it[3])continue;const line=`- [${VAULT.cols[it[0]][1]}] @${it[1]}: ${it[3].slice(0,600)}\n`;if(ctx.length+line.length>45000)break;ctx+=line;n++}
+  if(!sample){out.innerHTML=`<div class="card">${pool.slice(0,15).map(postHtml).join("")}</div>`;return}
+  out.innerHTML=`<p class="hint">Reading ${n} of your saved posts…</p>`;
+  try{const res=await sample(`You are Jarmoo, Moses's personal assistant. Answer his question using ONLY the Instagram posts he saved (below). Be practical, organised and concise; mention the @account when you use a specific post; reply in his language. Flag anything medically or financially risky and suggest checking with a professional where appropriate.\n\nQuestion: ${q}\n\nHis saved posts (${n}):\n${ctx}`,{cache:false,modelTier:"default",onText:({text})=>{out.innerHTML=`<div class="card">${md(text)}</div>`}});out.innerHTML=`<div class="card" style="white-space:pre-wrap">${md(res.text)}</div>`}catch(e){out.innerHTML=`<p class="hint">Couldn't answer right now.</p>`}
+}
+$("#vAskBtn").onclick=askVault;$("#vAsk").addEventListener("keydown",e=>{if(e.key==="Enter")askVault()});
+
+/* ================= INIT ================= */
+$("#sx").textContent=EXCEL.length;$("#sp").textContent=PC.length;$("#ss").textContent=Object.values(KEYS).reduce((a,b)=>a+b.length,0);$("#sa").textContent=AI.length;
+renderExcel();renderPC();renderKeys();renderAI();newType();
+openMod((location.hash||"#home").slice(1));
+addMsg("j","Systems online, Moses. I now hold all 4,141 posts from your 42 Instagram collections. Forex comes first: live sessions in EAT, risk calculator, entry checklist, AI chart reading and your journal are in Forex Command. Health, knowledge, business and the rest are in your Life Vault.\n\nTalk to me, type a question, or try “open excel”, “my laptop is slow”, “note …” or “focus 25”.");
+
+(async()=>{
+  if(!window.claude||!claude.use)return;
+  claude.use("sample").then(s=>{sample=s;if(!s)$("#xbBtn").textContent="Search"}).catch(()=>{});
+  loadVault();
+  claude.use("downloads").then(d=>{downloads=d}).catch(()=>{});
+  claude.use("dictation").then(d=>{
+    dict=d;if(!d){$("#voiceHint").textContent="Voice input works in Chrome or the Claude desktop app";return}
+    d.onPartial(({text})=>{if(hf.on){hfPartial(text)}else $("#ask").value=(heard+" "+text).trim()});
+    d.onFinal(({text})=>{if(hf.on){hfHeard(text)}else{heard=(heard+" "+text).trim();$("#ask").value=heard}});
+    d.onState(({state,reason})=>{
+      listening=state==="listening";$("#micBtn").classList.toggle("on",listening&&!hf.on);
+      if(listening)setState("listen",hf.on?"HANDS-FREE":"LISTENING");
+      else if(hf.on){if(!micBlocked()){if(!speaking)setState("",reason==="hidden"?"PAUSED":"HANDS-FREE");hfResume(300)}}
+      else{setState("","STANDING BY");const v=$("#ask").value.trim();if(v){$("#ask").value="";ask(v)}}
+    });
+    armAuto();
+  }).catch(()=>{});
+  claude.use("tts").then(t=>{tts=t;setTimeout(renderVoiceStudio,50);if(!t&&!("speechSynthesis" in window)){$("#ttsBtn").style.display="none";return}if(!t){try{if(localStorage.getItem("jv_tts")==="1"){ttsOn=true;$("#ttsBtn").classList.add("on");$("#ttsBtn").textContent="🔊"}}catch(e){}return}
+    try{if(localStorage.getItem("jv_tts")==="1"){ttsOn=true;$("#ttsBtn").classList.add("on");$("#ttsBtn").textContent="🔊"}}catch(e){}
+    t.onState(({state})=>{if(state==="idle"&&$("#reactor").classList.contains("speak"))setState("",hf.on?"HANDS-FREE":"STANDING BY")});
+  }).catch(()=>{});
+  try{
+    const [d,u]=await Promise.all([claude.use("db"),claude.use("user")]);
+    if(d&&u){
+      db=d;userId=await u.id();if(!userId)return;
+      const col=db.doc("data/users/"+userId+"/jarvis").collection("notes");
+      const timer=setTimeout(()=>{$("#noteWhere").textContent="Can't reach your synced notes yet. Showing the copy saved on this device."},10000);
+      col.onSnapshot(snap=>{
+        if(!snap.metadata.fromCache)clearTimeout(timer);
+        notesCol=col;
+        const remote=snap.docs.map(doc=>({id:doc.id,...doc.data()}));
+        const loc=localNotes().filter(l=>!remote.find(r=>r.id===l.id));
+        if(loc.length){loc.forEach(n=>notesCol.doc(n.id).set({text:n.text,ts:n.ts,done:!!n.done}).catch(()=>{}));try{localStorage.removeItem("jv_notes")}catch(e){}}
+        NOTES=[...remote,...loc];renderNotes();
+        $("#noteWhere").textContent="Synced to your account. Open Jarmoo on any device and your notes are there.";
+      },()=>{clearTimeout(timer)});
+      const tcol=db.doc("data/users/"+userId+"/jarvis").collection("trades");
+      tcol.onSnapshot(snap=>{tradesCol=tcol;const remote=snap.docs.map(d=>({id:d.id,...d.data()}));const loc=localTrades().filter(l=>!remote.find(r=>r.id===l.id));if(loc.length){loc.forEach(t=>tcol.doc(t.id).set(t).catch(()=>{}));try{localStorage.removeItem("jv_trades")}catch(e){}}TRADES=[...remote,...loc];renderJournal()},()=>{});
+    }
+  }catch(e){}
+})();
+</script>
+</body>
+</html>
